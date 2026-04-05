@@ -5,6 +5,9 @@
   "providers": {
     "chatgpt": {
       "enabled": true
+    },
+    "claude": {
+      "enabled": false
     }
   },
   "account": {

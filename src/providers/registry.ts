@@ -12,8 +12,14 @@ export interface ProviderPage {
   close(): Promise<void>;
 }
 
-/** Factory: given a Playwright Page, config, and resolved provider URL, construct a ProviderPage */
-export type ProviderPageFactory = (page: Page, config: Config, providerUrl: string) => ProviderPage;
+/** Options passed to the page factory at session creation time */
+export interface ProviderPageOptions {
+  providerUrl: string;
+  ephemeral: boolean;
+}
+
+/** Factory: given a Playwright Page, config, and provider options, construct a ProviderPage */
+export type ProviderPageFactory = (page: Page, config: Config, options: ProviderPageOptions) => ProviderPage;
 
 /** Check whether the browser is authenticated for this provider */
 export type AuthChecker = (

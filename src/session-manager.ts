@@ -22,6 +22,7 @@ export interface ProviderRuntime {
   pageFactory: ProviderPageFactory;
   authExpiredDetector: AuthExpiredDetector;
   providerUrl: string;
+  ephemeral: boolean;
 }
 
 /** Internal session structure containing the ProviderPage instance and concurrency lock */
@@ -182,7 +183,10 @@ export class SessionManager {
       try {
         const context = await this.browserManager.getContext();
         const page = await context.newPage();
-        providerPage = runtime.pageFactory(page, this.config, runtime.providerUrl);
+        providerPage = runtime.pageFactory(page, this.config, {
+          providerUrl: runtime.providerUrl,
+          ephemeral: runtime.ephemeral,
+        });
         await providerPage.navigateToNewChat();
       } catch (err: unknown) {
         // Check if auth expired and clean up the created page

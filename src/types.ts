@@ -15,6 +15,8 @@ export interface ProviderConfig {
   enabled: boolean;
   /** Override the provider's default base URL */
   providerUrl?: string;
+  /** Use ephemeral/temporary chat mode (not saved to account history). Default: true */
+  ephemeral: boolean;
 }
 
 export interface Config {

@@ -11,6 +11,7 @@ import type { Config, ProviderConfig } from "./types.js";
 /** Default provider config */
 const DEFAULT_PROVIDER: ProviderConfig = {
   enabled: true,
+  ephemeral: true,
 };
 
 /** Default config, used when no config.json is provided */
@@ -19,6 +20,7 @@ const DEFAULTS: Config = {
   headless: true,
   providers: {
     chatgpt: { ...DEFAULT_PROVIDER },
+    claude: { enabled: false, ephemeral: true },
   },
   maxSessions: 20,
   cdpPort: 9222,

@@ -1,13 +1,12 @@
-// ChatGPT page interaction layer: encapsulates input, send, wait for reply, and extract reply text DOM operations
+// Claude page interaction layer: encapsulates input, send, wait for reply, and extract reply text DOM operations
 //
-// Adapts to ChatGPT's frequently changing DOM structure via candidate selector lists.
+// Adapts to Claude.ai's DOM structure via candidate selector lists.
 // resolveSelector() probes candidates by priority and caches the match; retries on invalidation.
 // Long text (>2000 chars) is sent via clipboard paste with a global mutex to prevent concurrent overwrites.
-// Reply detection has two phases: stop button disappears -> text stability check,
-// balancing fast replies and streaming output.
+// Reply detection has two phases: streaming indicator disappears -> text stability check.
 // Timeout scenarios carry partialResponse to avoid total loss after long waits.
 
-import type { Page, Locator } from "playwright";
+import type { Page } from "playwright";
 import type { Config } from "../../types.js";
 import { ProxyError, ErrorCode } from "../../errors.js";
 import type { ProviderPage, ProviderPageOptions } from "../registry.js";
@@ -44,37 +43,34 @@ function releaseClipboard(): void {
  */
 const SELECTOR_CANDIDATES = {
   messageInput: [
-    "#prompt-textarea",
-    '[data-testid="composer-input"]',
-    'textarea[placeholder*="Message"]',
-    "div.ProseMirror[contenteditable]",
+    "div.ProseMirror[contenteditable='true']",
+    'div[contenteditable="true"]',
   ],
   sendButton: [
+    'button[aria-label="Send Message"]',
+    'button[aria-label="Send message"]',
     'button[data-testid="send-button"]',
-    'button[aria-label="Send prompt"]',
-    'button[aria-label="Send"]',
-    "#composer-submit-button",
+    'fieldset button:has(> svg)',
   ],
   stopButton: [
-    'button[data-testid="stop-button"]',
-    'button[aria-label="Stop streaming"]',
-    'button[aria-label="Stop generating"]',
+    'button[aria-label="Stop Response"]',
+    'button[aria-label="Stop response"]',
     'button[aria-label="Stop"]',
   ],
 };
 
 /**
- * Assistant message selectors — observation targets that may not exist in a new conversation.
+ * Assistant message selectors — targets the response content containers.
  * Queries the current DOM each time; not cached.
  */
 const ASSISTANT_MESSAGE_SELECTORS = [
-  '[data-message-author-role="assistant"]',
-  '[data-role="assistant"]',
-  ".agent-turn",
+  "[data-is-streaming]",
+  'div[data-testid="assistant-message"]',
+  ".font-claude-message",
 ];
 
-/** Encapsulates interaction with a single ChatGPT page tab */
-export class ChatGPTPage implements ProviderPage {
+/** Encapsulates interaction with a single Claude.ai page tab */
+export class ClaudePage implements ProviderPage {
   private page: Page;
   private config: Config;
   private providerUrl: string;
@@ -95,9 +91,8 @@ export class ChatGPTPage implements ProviderPage {
    */
   private async resolveSelector(
     key: keyof typeof SELECTOR_CANDIDATES,
-    timeout = 3000
+    timeout = 3000,
   ): Promise<string> {
-    // Check if the cached selector is still visible
     if (this.resolved[key]) {
       const visible = await this.page
         .locator(this.resolved[key])
@@ -110,7 +105,6 @@ export class ChatGPTPage implements ProviderPage {
 
     const candidates = SELECTOR_CANDIDATES[key];
 
-    // Quick check: iterate all candidates
     for (const sel of candidates) {
       const visible = await this.page
         .locator(sel)
@@ -123,7 +117,6 @@ export class ChatGPTPage implements ProviderPage {
       }
     }
 
-    // Wait for any candidate to become visible
     const combined = candidates.join(", ");
     await this.page.waitForSelector(combined, {
       state: "visible",
@@ -144,7 +137,7 @@ export class ChatGPTPage implements ProviderPage {
 
     throw new ProxyError(
       ErrorCode.PAGE_STRUCTURE_CHANGED,
-      `Unable to resolve visible selector for "${key}"`
+      `Unable to resolve visible selector for "${key}"`,
     );
   }
 
@@ -157,44 +150,26 @@ export class ChatGPTPage implements ProviderPage {
     return SELECTOR_CANDIDATES.stopButton.join(", ");
   }
 
-  /** Read composer text, compatible with both textarea and contenteditable implementations */
-  private async readComposerText(input: Locator): Promise<string> {
-    const tagName = await input
-      .evaluate((el) => el.tagName.toLowerCase())
-      .catch(() => "");
-    if (tagName === "textarea") {
-      return await input.inputValue().catch(() => "");
-    }
-    return await input.innerText().catch(() => "");
-  }
-
   /** Navigate to a new conversation page */
   async navigateToNewChat(): Promise<void> {
-    const query = this.ephemeral ? "?temporary-chat=true" : "";
-    await this.page.goto(`${this.providerUrl}/${query}`, {
+    const query = this.ephemeral ? "?incognito" : "";
+    await this.page.goto(`${this.providerUrl}/new${query}`, {
       waitUntil: "domcontentloaded",
       timeout: this.config.timeouts.navigation,
     });
 
     await this.resolveSelector("messageInput", this.config.timeouts.navigation);
-
-    // Dismiss any popups/overlays that may appear
-    await this.page.keyboard.press("Escape").catch(() => {});
-    await this.page.waitForTimeout(500);
   }
 
-  /** Send a message and wait for the ChatGPT reply; returns the reply text */
+  /** Send a message and wait for Claude's reply; returns the reply text */
   async sendMessage(text: string): Promise<string> {
-    // Record assistant message count before sending, to detect when a new reply appears
     const beforeCount = await this.assistantMessages().count();
 
-    // Focus the input (ProseMirror needs focus and selection established first)
     const inputSel = await this.resolveSelector("messageInput");
     const input = this.page.locator(inputSel);
     await input.click();
 
     if (text.length > 2000) {
-      // Long text via clipboard paste; requires global lock to prevent concurrent conflicts
       await acquireClipboard();
       try {
         await this.page
@@ -206,7 +181,6 @@ export class ChatGPTPage implements ProviderPage {
         const modifier = process.platform === "darwin" ? "Meta" : "Control";
         await this.page.keyboard.press(`${modifier}+KeyV`);
 
-        // Clear clipboard after paste
         await this.page
           .evaluate(async () => navigator.clipboard.writeText(""))
           .catch(() => {});
@@ -214,31 +188,19 @@ export class ChatGPTPage implements ProviderPage {
         releaseClipboard();
       }
 
-      // After pasting long text, ChatGPT may convert it to a file attachment
-      const attached = await this.waitForAttachment(10_000);
-
-      if (attached) {
-        // Composer is cleared after attachment creation; fill in the prompt to enable sending
-        await input.click();
-        await input.pressSequentially(this.config.attachmentPrompt, {
-          delay: 5,
-        });
-      } else {
-        // No attachment generated — verify text remains in the composer
-        const composerText = await this.readComposerText(input);
-        if (composerText.trim().length === 0) {
-          throw new ProxyError(
-            ErrorCode.PAGE_STRUCTURE_CHANGED,
-            "Long text paste failed: no attachment or composer content detected"
-          );
-        }
+      // Verify text was pasted into the composer
+      await this.page.waitForTimeout(500);
+      const composerText = await input.innerText().catch(() => "");
+      if (composerText.trim().length === 0) {
+        throw new ProxyError(
+          ErrorCode.PAGE_STRUCTURE_CHANGED,
+          "Long text paste failed: no composer content detected",
+        );
       }
     } else {
-      // Short text: type character-by-character to work around contenteditable fill() issues
       await input.pressSequentially(text, { delay: 5 });
     }
 
-    // Wait for the send button to become available and click it
     await this.waitUntilSendReadyAndSubmit();
 
     // Wait for a new assistant message to appear
@@ -252,17 +214,16 @@ export class ChatGPTPage implements ProviderPage {
     } catch {
       throw new ProxyError(
         ErrorCode.PAGE_STRUCTURE_CHANGED,
-        "No new assistant message appeared — ChatGPT page structure may have changed"
+        "No new assistant message appeared — Claude page structure may have changed",
       );
     }
 
-    // Wait for streaming response to finish (throws RESPONSE_TIMEOUT with partial reply on timeout)
     await this.waitForResponseComplete();
 
     return this.getLastAssistantMessage();
   }
 
-  /** Wait for ChatGPT streaming response to complete: stop button disappears, then text stability check */
+  /** Wait for Claude streaming response to complete: stop button disappears, then text stability check */
   private async waitForResponseComplete(): Promise<void> {
     const { response: responseTimeout, stability: stabilityMs } =
       this.config.timeouts;
@@ -278,7 +239,6 @@ export class ChatGPTPage implements ProviderPage {
       .catch(() => false);
 
     if (!alreadyVisible) {
-      // Not yet visible — wait briefly (fast replies may skip this phase)
       try {
         await this.page.waitForSelector(stopSel, {
           state: "visible",
@@ -289,7 +249,6 @@ export class ChatGPTPage implements ProviderPage {
       }
     }
 
-    // Wait for the stop button to disappear (streaming output finished)
     let stopButtonCleared = false;
     try {
       const remaining = Math.max(0, deadline - Date.now());
@@ -302,9 +261,7 @@ export class ChatGPTPage implements ProviderPage {
       // Timed out — continue to stability check
     }
 
-    // Phase 2: text stability check — confirm reply text has stopped changing
-    // After normal stop button clearance, only a quick confirmation is needed;
-    // on timeout, use the full stability window
+    // Phase 2: text stability check
     const effectiveStability = stopButtonCleared ? checkInterval : stabilityMs;
     let lastText = "";
     let stableTime = 0;
@@ -323,12 +280,11 @@ export class ChatGPTPage implements ProviderPage {
       await this.page.waitForTimeout(checkInterval);
     }
 
-    // Timed out — must return RESPONSE_TIMEOUT, not 200
     const partialText = await this.getLastAssistantMessage();
     throw new ProxyError(
       ErrorCode.RESPONSE_TIMEOUT,
-      "Timed out waiting for ChatGPT response",
-      partialText || undefined
+      "Timed out waiting for Claude response",
+      partialText || undefined,
     );
   }
 
@@ -340,17 +296,6 @@ export class ChatGPTPage implements ProviderPage {
 
     const last = messages.nth(count - 1);
     return (await last.innerText()).trim();
-  }
-
-  /** Wait for attachment element to appear after long text paste; returns whether it succeeded */
-  private async waitForAttachment(timeout: number): Promise<boolean> {
-    const sel = 'button[aria-label^="Remove file"]';
-    try {
-      await this.page.waitForSelector(sel, { state: "visible", timeout });
-      return true;
-    } catch {
-      return false;
-    }
   }
 
   /** Wait for the send button to become clickable and submit; falls back to Enter key on timeout */
@@ -374,9 +319,9 @@ export class ChatGPTPage implements ProviderPage {
       await this.page.waitForTimeout(200);
     }
 
-    // Fallback: use Enter key when no usable button is found
+    // Fallback: use Enter key
     const input = this.page.locator(
-      await this.resolveSelector("messageInput")
+      await this.resolveSelector("messageInput"),
     );
     await input.click();
     await this.page.keyboard.press("Enter");
@@ -386,7 +331,6 @@ export class ChatGPTPage implements ProviderPage {
     return this.page.url();
   }
 
-  /** Close the page tab */
   async close(): Promise<void> {
     await this.page.close().catch(() => {});
   }

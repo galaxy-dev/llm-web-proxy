@@ -39,6 +39,7 @@ import type { Config } from "./types.js";
 import { PROVIDERS, type ProviderDefinition } from "./providers/registry.js";
 import type { ProviderRuntime } from "./session-manager.js";
 import "./providers/chatgpt/index.js";
+import "./providers/claude/index.js";
 import { BrowserManager } from "./browser-manager.js";
 import { SessionManager } from "./session-manager.js";
 import { buildServer } from "./server.js";
@@ -119,6 +120,7 @@ export async function startProxy(): Promise<Config> {
       pageFactory: provDef.pageFactory,
       authExpiredDetector: provDef.authExpiredDetector,
       providerUrl: getProviderUrl(config, name, provDef),
+      ephemeral: config.providers[name].ephemeral,
     });
   }
 

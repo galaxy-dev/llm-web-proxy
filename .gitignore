@@ -5,5 +5,5 @@ node_modules/
 build/
 dist/
 
-
+config.json
 .llm-web-proxy/

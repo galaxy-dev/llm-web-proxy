@@ -7,7 +7,7 @@ const chatgptProvider: ProviderDefinition = {
   name: "chatgpt",
   baseUrl: "https://chatgpt.com",
 
-  pageFactory: (page, config, providerUrl) => new ChatGPTPage(page, config, providerUrl),
+  pageFactory: (page, config, options) => new ChatGPTPage(page, config, options),
 
   authChecker: async (context, config, providerUrl) => {
     const page = await context.newPage();
