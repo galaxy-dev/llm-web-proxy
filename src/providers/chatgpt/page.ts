@@ -193,8 +193,8 @@ export class ChatGPTPage implements ProviderPage {
     const input = this.page.locator(inputSel);
     await input.click();
 
-    if (text.length > 2000) {
-      // Long text via clipboard paste; requires global lock to prevent concurrent conflicts
+    if (text.length > 2000 || text.includes("\n")) {
+      // Clipboard paste for long text or text with newlines (Enter triggers send in chat UIs)
       await acquireClipboard();
       try {
         await this.page

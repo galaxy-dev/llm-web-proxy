@@ -169,7 +169,7 @@ export class ClaudePage implements ProviderPage {
     const input = this.page.locator(inputSel);
     await input.click();
 
-    if (text.length > 2000) {
+    if (text.length > 2000 || text.includes("\n")) {
       await acquireClipboard();
       try {
         await this.page

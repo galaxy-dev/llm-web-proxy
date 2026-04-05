@@ -12,20 +12,14 @@ pnpm exec playwright install chromium
 ## Usage
 
 ```bash
-# 1. Login (opens browser for manual auth — all enabled providers)
-pnpm run login
-
-# 2. Start server
-pnpm run dev
-
-# 3. Start MCP server (includes proxy + MCP endpoint)
+# Start MCP server (includes proxy + MCP endpoint)
 pnpm run mcp
 ```
 
 Server binds to `127.0.0.1:3210`. MCP SSE endpoint on `0.0.0.0:3211`.
 
-On startup (`dev` or `mcp`), all enabled providers are auth-checked.
-Unauthenticated providers open login tabs in parallel for manual login.
+On startup, all enabled providers are auth-checked automatically.
+Unauthenticated providers open login tabs in parallel for manual login — no separate login step needed.
 
 ## API
 
@@ -62,13 +56,16 @@ Copy `config.example.json` to `config.json`. All fields optional, defaults:
 | port | 3210 |
 | headless | true |
 | maxSessions | 20 |
-| providers.chatgpt.enabled | true |
-| providers.chatgpt.providerUrl | (from provider definition) |
+| providers.\<name\>.enabled | true (chatgpt) / false (claude) |
+| providers.\<name\>.ephemeral | true |
+| providers.\<name\>.providerUrl | (from provider definition) |
 | account.name | "default" |
 | account.storageStatePath | "./.llm-web-proxy/accounts/default.json" |
 | timeouts.navigation | 30000 |
 | timeouts.response | 120000 |
 | timeouts.stability | 2000 |
+
+`ephemeral` uses temporary/incognito chat mode so conversations are not saved to the account history (ChatGPT: `?temporary-chat=true`, Claude: `?incognito`).
 
 ### Multi-provider example
 
@@ -76,9 +73,9 @@ Copy `config.example.json` to `config.json`. All fields optional, defaults:
 {
   "providers": {
     "chatgpt": { "enabled": true },
-    "claude": { "enabled": true }
+    "claude": { "enabled": true, "ephemeral": false }
   }
 }
 ```
 
-Set `"enabled": false` to disable a provider without removing its config.
+Set `"enabled": false` to disable a provider. Set `"ephemeral": false` to save conversations to account history.
