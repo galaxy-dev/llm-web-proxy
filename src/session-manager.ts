@@ -1,6 +1,7 @@
 // Session manager: create/close sessions, send/receive messages, concurrency control,
 // session invalidation after browser reconnection
 //
+// Supports multiple providers: each session is bound to a specific provider at creation time.
 // Each session corresponds to an independent provider tab (ProviderPage), serialized by SessionLock
 // to handle concurrent requests within the same session (LLM pages cannot handle parallel input).
 // SessionLock supports drain() for teardown: rejects all queued requests on session close,
@@ -11,13 +12,22 @@
 import { v4 as uuidv4 } from "uuid";
 import type { Config, SessionInfo } from "./types.js";
 import { BrowserManager } from "./browser-manager.js";
-import type { ProviderPage, ProviderPageFactory, AuthExpiredDetector } from "./providers/registry.js";
+import type { ProviderPageFactory, AuthExpiredDetector } from "./providers/registry.js";
+import type { ProviderPage } from "./providers/registry.js";
 import { ProxyError, ErrorCode } from "./errors.js";
 import { SessionStore } from "./session-store.js";
+
+/** Per-provider runtime dependencies needed to create and manage sessions */
+export interface ProviderRuntime {
+  pageFactory: ProviderPageFactory;
+  authExpiredDetector: AuthExpiredDetector;
+  providerUrl: string;
+}
 
 /** Internal session structure containing the ProviderPage instance and concurrency lock */
 interface InternalSession {
   id: string;
+  provider: string;
   accountName: string;
   createdAt: Date;
   lastActivity: Date;
@@ -126,19 +136,17 @@ export class SessionManager {
   private browserManager: BrowserManager;
   private config: Config;
   private store: SessionStore;
-  private pageFactory: ProviderPageFactory;
-  private authExpiredDetector: AuthExpiredDetector;
+  /** Per-provider runtime dependencies */
+  private providerRuntimes: Map<string, ProviderRuntime>;
 
   constructor(
     config: Config,
     browserManager: BrowserManager,
-    pageFactory: ProviderPageFactory,
-    authExpiredDetector: AuthExpiredDetector,
+    providerRuntimes: Map<string, ProviderRuntime>,
   ) {
     this.config = config;
     this.browserManager = browserManager;
-    this.pageFactory = pageFactory;
-    this.authExpiredDetector = authExpiredDetector;
+    this.providerRuntimes = providerRuntimes;
     this.store = new SessionStore();
 
     // On browser reconnect, all page handles become invalid; batch-mark sessions as stale
@@ -148,8 +156,16 @@ export class SessionManager {
     });
   }
 
-  /** Create a new session: open a new LLM conversation page */
-  async createSession(): Promise<SessionInfo> {
+  /** Create a new session for the specified provider: open a new LLM conversation page */
+  async createSession(providerName: string): Promise<SessionInfo> {
+    const runtime = this.providerRuntimes.get(providerName);
+    if (!runtime) {
+      throw new ProxyError(
+        ErrorCode.BAD_REQUEST,
+        `Provider "${providerName}" is not available. Available: ${[...this.providerRuntimes.keys()].join(", ")}`,
+      );
+    }
+
     const effectiveCount = this.sessions.size + this.pendingCreates;
     if (effectiveCount >= this.config.maxSessions) {
       throw new ProxyError(
@@ -166,18 +182,18 @@ export class SessionManager {
       try {
         const context = await this.browserManager.getContext();
         const page = await context.newPage();
-        providerPage = this.pageFactory(page, this.config);
+        providerPage = runtime.pageFactory(page, this.config, runtime.providerUrl);
         await providerPage.navigateToNewChat();
       } catch (err: unknown) {
         // Check if auth expired and clean up the created page
         if (providerPage) {
           const url = providerPage.getPageUrl();
           await providerPage.close();
-          if (this.authExpiredDetector(url)) {
-            this.browserManager.invalidateAuth();
+          if (runtime.authExpiredDetector(url)) {
+            this.browserManager.invalidateProviderAuth(providerName);
             throw new ProxyError(
               ErrorCode.AUTH_EXPIRED,
-              `Account "${accountName}" login session expired — re-run login flow`
+              `Account "${accountName}" login session expired for ${providerName} — re-run login flow`
             );
           }
         }
@@ -193,6 +209,7 @@ export class SessionManager {
 
       const session: InternalSession = {
         id,
+        provider: providerName,
         accountName,
         createdAt: now,
         lastActivity: now,
@@ -206,7 +223,7 @@ export class SessionManager {
 
       this.sessions.set(id, session);
       this.persistSession(session);
-      console.log(`Session ${id} created (account: ${accountName})`);
+      console.log(`Session ${id} created (provider: ${providerName}, account: ${accountName})`);
 
       return this.toPublicSession(session);
     } finally {
@@ -263,12 +280,13 @@ export class SessionManager {
         );
       }
       // Best-effort auth expiry detection
+      const runtime = this.providerRuntimes.get(session.provider);
       const url = session.providerPage.getPageUrl();
-      if (this.authExpiredDetector(url)) {
-        this.browserManager.invalidateAuth();
+      if (runtime?.authExpiredDetector(url)) {
+        this.browserManager.invalidateProviderAuth(session.provider);
         throw new ProxyError(
           ErrorCode.AUTH_EXPIRED,
-          `Account "${session.accountName}" login session expired — re-run login flow`
+          `Account "${session.accountName}" login session expired for ${session.provider} — re-run login flow`
         );
       }
       if (err instanceof ProxyError) throw err;
@@ -291,6 +309,7 @@ export class SessionManager {
     if (persisted?.stale) {
       return {
         id: persisted.id,
+        provider: persisted.provider,
         accountName: persisted.accountName,
         createdAt: new Date(persisted.createdAt),
         lastActivity: new Date(persisted.lastActivity),
@@ -314,6 +333,7 @@ export class SessionManager {
       .filter((s) => s.stale && !liveIds.has(s.id))
       .map((s) => ({
         id: s.id,
+        provider: s.provider,
         accountName: s.accountName,
         createdAt: new Date(s.createdAt),
         lastActivity: new Date(s.lastActivity),
@@ -367,6 +387,7 @@ export class SessionManager {
           // Persist stale state before closing the page — preserves records even if close() fails
           this.store.save({
             id: session.id,
+            provider: session.provider,
             accountName: session.accountName,
 
             createdAt: session.createdAt.toISOString(),
@@ -441,6 +462,7 @@ export class SessionManager {
     }
     return {
       id: session.id,
+      provider: session.provider,
       accountName: session.accountName,
       createdAt: session.createdAt,
       lastActivity: session.lastActivity,
@@ -453,6 +475,7 @@ export class SessionManager {
   private persistSession(session: InternalSession): void {
     this.store.save({
       id: session.id,
+      provider: session.provider,
       accountName: session.accountName,
       createdAt: session.createdAt.toISOString(),
       lastActivity: session.lastActivity.toISOString(),

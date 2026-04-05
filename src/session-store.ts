@@ -19,6 +19,7 @@ import { resolve, dirname } from "node:path";
 /** Session data structure persisted to disk */
 export interface PersistedSession {
   id: string;
+  provider: string;
   accountName: string;
   createdAt: string;
   lastActivity: string;

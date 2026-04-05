@@ -77,12 +77,14 @@ const ASSISTANT_MESSAGE_SELECTORS = [
 export class ChatGPTPage implements ProviderPage {
   private page: Page;
   private config: Config;
+  private providerUrl: string;
   /** Resolved selector cache to avoid repeated probing */
   private resolved: Record<string, string> = {};
 
-  constructor(page: Page, config: Config) {
+  constructor(page: Page, config: Config, providerUrl: string) {
     this.page = page;
     this.config = config;
+    this.providerUrl = providerUrl;
   }
 
   /**
@@ -167,7 +169,7 @@ export class ChatGPTPage implements ProviderPage {
   /** Navigate to a new temporary conversation page */
   async navigateToNewChat(): Promise<void> {
     // temporary-chat=true prevents saving chat history to the account
-    await this.page.goto(`${this.config.providerUrl}/?temporary-chat=true`, {
+    await this.page.goto(`${this.providerUrl}/?temporary-chat=true`, {
       waitUntil: "domcontentloaded",
       timeout: this.config.timeouts.navigation,
     });

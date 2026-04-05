@@ -10,13 +10,18 @@ export interface AccountConfig {
   storageStatePath: string;
 }
 
+/** Per-provider configuration */
+export interface ProviderConfig {
+  enabled: boolean;
+  /** Override the provider's default base URL */
+  providerUrl?: string;
+}
+
 export interface Config {
   port: number;
   headless: boolean;
-  /** Which AI provider to use: "chatgpt" | "claude" */
-  provider: string;
-  /** Provider base URL (resolved from provider definition if not set) */
-  providerUrl: string;
+  /** Per-provider settings keyed by provider name */
+  providers: Record<string, ProviderConfig>;
   maxSessions: number;
   /** Chrome remote debugging port */
   cdpPort: number;
@@ -40,6 +45,7 @@ export type SessionStatus = "active" | "closing" | "stale" | "error";
 
 export interface SessionInfo {
   id: string;
+  provider: string;
   accountName: string;
   createdAt: Date;
   lastActivity: Date;

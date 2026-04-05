@@ -2,7 +2,8 @@
 //
 // Uses real Chrome (not Playwright's bundled browser) + CDP remote debugging,
 // to bypass LLM site automation fingerprint detection. Auth state persists via --user-data-dir.
-// Automatically checks auth validity on startup; launches visual login flow when expired.
+// Supports multi-provider auth: tracks per-provider authentication status,
+// and provides parallel login flow (one tab per provider).
 // Reconnects automatically on browser disconnection, notifying upper layers via reconnectListeners
 // (SessionManager uses this to batch-invalidate existing sessions' Page handles).
 
@@ -26,26 +27,35 @@ export class BrowserManager {
   private chromeProcess: ChildProcess | null = null;
   private context: BrowserContext | null = null;
   private config: Config;
-  private authChecker: AuthChecker;
-  private baseUrl: string;
   /** Callbacks invoked after browser reconnection, used to notify upper layers of session invalidation */
   private reconnectListeners: Array<() => Promise<void>> = [];
-  private _authenticated = false;
+  /** Per-provider authentication status */
+  private authStatuses = new Map<string, boolean>();
 
-  constructor(config: Config, authChecker: AuthChecker, baseUrl: string) {
+  constructor(config: Config) {
     this.config = config;
-    this.authChecker = authChecker;
-    this.baseUrl = baseUrl;
   }
 
-  /** Cached auth state, updated by ensureAuth() and invalidateAuth() */
-  get authenticated(): boolean {
-    return this._authenticated;
+  /** Get cached auth state for a specific provider */
+  isProviderAuthenticated(providerName: string): boolean {
+    return this.authStatuses.get(providerName) ?? false;
   }
 
-  /** Mark auth as invalid, called by SessionManager when AUTH_EXPIRED is detected */
-  invalidateAuth(): void {
-    this._authenticated = false;
+  /** Mark a provider's auth as invalid, called by SessionManager when AUTH_EXPIRED is detected */
+  invalidateProviderAuth(providerName: string): void {
+    this.authStatuses.set(providerName, false);
+  }
+
+  /** Check auth for a specific provider using its auth checker; updates cached status */
+  async checkProviderAuth(
+    providerName: string,
+    authChecker: AuthChecker,
+    providerUrl: string,
+  ): Promise<boolean> {
+    if (!this.context) return false;
+    const result = await authChecker(this.context, this.config, providerUrl);
+    this.authStatuses.set(providerName, result);
+    return result;
   }
 
   /** Chrome user data directory, isolated by account name */
@@ -95,6 +105,8 @@ export class BrowserManager {
       `--user-data-dir=${profileDir}`,
       "--no-first-run",
       "--no-default-browser-check",
+      "--hide-crash-restore-bubble",
+      "--noerrdialogs",
     ];
     if (headless) args.push("--headless=new");
 
@@ -146,27 +158,6 @@ export class BrowserManager {
     console.log(`Chrome launched via CDP (headless: ${this.config.headless})`);
   }
 
-  /** Check if the current browser session is authenticated (delegates to provider's authChecker) */
-  async checkAuth(): Promise<boolean> {
-    if (!this.context) return false;
-    return this.authChecker(this.context, this.config);
-  }
-
-  /** Ensure auth is valid; automatically launches interactive login flow when expired */
-  async ensureAuth(): Promise<void> {
-    if (await this.checkAuth()) {
-      this._authenticated = true;
-      return;
-    }
-
-    this._authenticated = false;
-    console.log("Auth expired — launching browser for login...");
-    await this.close();
-    await this.loginFlow();
-    await this.launch();
-    this._authenticated = true;
-  }
-
   /** Get the shared browser context (auto-reconnects on disconnect) */
   async getContext(): Promise<BrowserContext> {
     if (this.context) {
@@ -205,30 +196,39 @@ export class BrowserManager {
   }
 
   /**
-   * Open a visible Chrome window for manual login.
+   * Open a visible Chrome window for manual login across multiple providers.
+   * Opens one tab per provider; user logs in to all, then presses Enter.
    * Auth state persists via Chrome --user-data-dir, surviving restarts.
    */
-  async loginFlow(): Promise<void> {
+  async loginFlowMulti(
+    providers: Array<{ name: string; baseUrl: string }>,
+  ): Promise<void> {
     const account = this.config.account;
 
     const browser = await this.launchChrome(false);
     const context = browser.contexts()[0];
-    // Only close Chrome's initial blank/chrome tabs
+    // Close Chrome's initial blank/chrome tabs
     for (const p of context.pages()) {
       const url = p.url();
       if (url === "about:blank" || url.startsWith("chrome://newtab")) {
         await p.close().catch(() => {});
       }
     }
-    const page = await context.newPage();
 
-    console.log(`\nNavigating to ${this.baseUrl} ...`);
-    console.log("Please log in manually. Press Enter in the terminal when done.\n");
+    // Open one tab per provider, navigating in parallel
+    console.log(`\nOpening login pages for: ${providers.map((p) => p.name).join(", ")}`);
+    await Promise.all(
+      providers.map(async (prov) => {
+        const page = await context.newPage();
+        console.log(`  ${prov.name}: ${prov.baseUrl}`);
+        await page.goto(prov.baseUrl, {
+          waitUntil: "domcontentloaded",
+          timeout: this.config.timeouts.navigation,
+        });
+      }),
+    );
 
-    await page.goto(this.baseUrl, {
-      waitUntil: "domcontentloaded",
-      timeout: this.config.timeouts.navigation,
-    });
+    console.log("\nPlease log in to all providers. Press Enter in the terminal when done.\n");
 
     // Wait for the user to finish manual login and press Enter
     await new Promise<void>((resolve) => {
@@ -247,7 +247,8 @@ export class BrowserManager {
     console.log(`Storage state saved to ${storagePath}`);
 
     await browser.close();
-    this.killChrome();
+    // Wait for Chrome to fully exit so profile data is flushed to disk
+    await this.stopChrome();
   }
 
   /** Reconnect after browser disconnection: restart Chrome and notify all listeners */

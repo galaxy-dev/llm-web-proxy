@@ -7,12 +7,12 @@ const chatgptProvider: ProviderDefinition = {
   name: "chatgpt",
   baseUrl: "https://chatgpt.com",
 
-  pageFactory: (page, config) => new ChatGPTPage(page, config),
+  pageFactory: (page, config, providerUrl) => new ChatGPTPage(page, config, providerUrl),
 
-  authChecker: async (context, config) => {
+  authChecker: async (context, config, providerUrl) => {
     const page = await context.newPage();
     try {
-      await page.goto(config.providerUrl, {
+      await page.goto(providerUrl, {
         waitUntil: "domcontentloaded",
         timeout: config.timeouts.navigation,
       });

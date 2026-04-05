@@ -4,6 +4,10 @@
 //   Each GET /sse creates an independent McpServer + SSEServerTransport;
 //   POST /message routes to the corresponding connection via ?sessionId.
 //
+// Tools are provider-agnostic: ask/session_create take a "provider" param,
+// session_send/list/get/close operate by sessionId (provider is implicit).
+// provider_list and health return info about all enabled providers.
+//
 // Session isolation and keepalive:
 //   Each MCP connection maintains its own ownedSessions set, only operating on sessions it created.
 //   SSE connections send :ping heartbeats every 30s to prevent idle timeout disconnects.
@@ -21,6 +25,8 @@ const PROXY_URL = process.env.LLM_WEB_PROXY_URL ?? "http://localhost:3210";
 /** Populated by main() after config is loaded */
 let SSE_KEEPALIVE_INTERVAL_MS = 30_000;
 let ORPHAN_GRACE_PERIOD_MS = 60_000;
+/** Enabled provider names, populated at startup */
+let ENABLED_PROVIDERS: string[] = [];
 
 /** Sessions orphaned by a disconnected SSE connection, awaiting adoption or deletion */
 const orphanPool = new Map<string, { timer: NodeJS.Timeout; fromClient: string }>();
@@ -107,11 +113,21 @@ async function parseOrError<T>(
 }
 
 /** Register all MCP tools on the given server instance, scoped to ownedSessions */
-function registerTools(server: McpServer, ownedSessions: Set<string>, clientId: string, providerName: string) {
-  // Health check tool
+function registerTools(server: McpServer, ownedSessions: Set<string>, clientId: string) {
+  const providerEnum = z.enum(ENABLED_PROVIDERS as [string, ...string[]]);
+
+  // List available providers
   server.tool(
-    `${providerName}_health`,
-    "Check if the LLM web proxy service is running.",
+    "provider_list",
+    "List all available LLM providers.",
+    {},
+    async () => mcpText(JSON.stringify(ENABLED_PROVIDERS)),
+  );
+
+  // Health check: returns per-provider status
+  server.tool(
+    "health",
+    "Check if the LLM web proxy service is running and get per-provider auth status.",
     {},
     async () => {
       try {
@@ -124,14 +140,21 @@ function registerTools(server: McpServer, ownedSessions: Set<string>, clientId: 
     }
   );
 
-  // One-shot Q&A: auto create session -> send -> get reply -> close (naturally isolated, no ownership needed)
+  // One-shot Q&A: auto create session -> send -> get reply -> close
   server.tool(
-    `${providerName}_ask`,
+    "ask",
     "Send a message to the LLM and get a response. Auto-manages session lifecycle.",
-    { message: z.string().describe("The message to send to the LLM") },
-    async ({ message }) => {
+    {
+      provider: providerEnum.describe("The LLM provider to use"),
+      message: z.string().describe("The message to send to the LLM"),
+    },
+    async ({ provider, message }) => {
       const createResult = await parseOrError<{ sessionId: string }>(
-        await api("/sessions", { method: "POST" }),
+        await api("/sessions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ provider }),
+        }),
         "Failed to create session"
       );
       if ("error" in createResult) return createResult.error;
@@ -156,12 +179,18 @@ function registerTools(server: McpServer, ownedSessions: Set<string>, clientId: 
 
   // Multi-turn conversation: create session
   server.tool(
-    `${providerName}_session_create`,
+    "session_create",
     "Create a new LLM session for multi-turn conversation. Returns a session ID.",
-    {},
-    async () => {
+    {
+      provider: providerEnum.describe("The LLM provider to use"),
+    },
+    async ({ provider }) => {
       const result = await parseOrError<{ sessionId: string }>(
-        await api("/sessions", { method: "POST" }),
+        await api("/sessions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ provider }),
+        }),
         "Failed"
       );
       if ("error" in result) return result.error;
@@ -172,7 +201,7 @@ function registerTools(server: McpServer, ownedSessions: Set<string>, clientId: 
 
   // Multi-turn conversation: send message
   server.tool(
-    `${providerName}_session_send`,
+    "session_send",
     "Send a message to an existing LLM session.",
     {
       sessionId: z.string().describe("The session ID"),
@@ -197,11 +226,11 @@ function registerTools(server: McpServer, ownedSessions: Set<string>, clientId: 
 
   // Multi-turn conversation: list sessions owned by this connection
   server.tool(
-    `${providerName}_session_list`,
-    "List active LLM sessions owned by this connection.",
+    "session_list",
+    "List active LLM sessions owned by this connection (includes provider info).",
     {},
     async () => {
-      const result = await parseOrError<{ id: string }[]>(
+      const result = await parseOrError<{ id: string; provider: string }[]>(
         await api("/sessions"),
         "Failed"
       );
@@ -219,7 +248,7 @@ function registerTools(server: McpServer, ownedSessions: Set<string>, clientId: 
 
   // Multi-turn conversation: get session details
   server.tool(
-    `${providerName}_session_get`,
+    "session_get",
     "Get info for a specific LLM session. Returns error if not owned by this connection.",
     { sessionId: z.string().describe("The session ID") },
     async ({ sessionId }) => {
@@ -237,7 +266,7 @@ function registerTools(server: McpServer, ownedSessions: Set<string>, clientId: 
 
   // Multi-turn conversation: close session
   server.tool(
-    `${providerName}_session_close`,
+    "session_close",
     "Close an LLM session owned by this connection.",
     { sessionId: z.string().describe("The session ID to close") },
     async ({ sessionId }) => {
@@ -256,13 +285,13 @@ function registerTools(server: McpServer, ownedSessions: Set<string>, clientId: 
 }
 
 /** Create a new McpServer with all tools registered, returns owned session tracker */
-function createMcpServer(clientId: string, providerName: string): { server: McpServer; ownedSessions: Set<string> } {
+function createMcpServer(clientId: string): { server: McpServer; ownedSessions: Set<string> } {
   const server = new McpServer({
-    name: `${providerName}-proxy`,
+    name: "llm-web-proxy",
     version: "0.1.0",
   });
   const ownedSessions = new Set<string>();
-  registerTools(server, ownedSessions, clientId, providerName);
+  registerTools(server, ownedSessions, clientId);
   return { server, ownedSessions };
 }
 
@@ -272,6 +301,11 @@ async function main() {
   SSE_KEEPALIVE_INTERVAL_MS = config.sseKeepaliveSec * 1000;
   ORPHAN_GRACE_PERIOD_MS = config.orphanGraceSec * 1000;
 
+  // Collect enabled provider names
+  ENABLED_PROVIDERS = Object.entries(config.providers)
+    .filter(([, p]) => p.enabled)
+    .map(([name]) => name);
+
   const port = parseInt(process.env.MCP_PORT ?? "3211");
   const transports = new Map<string, SSEServerTransport>();
   let clientSeq = 0;
@@ -280,8 +314,8 @@ async function main() {
     const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
 
     if (req.method === "GET" && url.pathname === "/sse") {
-      const clientId = `[${config.provider}-proxy:sse-client:${++clientSeq}]`;
-      const { server, ownedSessions } = createMcpServer(clientId, config.provider);
+      const clientId = `[llm-proxy:sse-client:${++clientSeq}]`;
+      const { server, ownedSessions } = createMcpServer(clientId);
       const transport = new SSEServerTransport("/message", res);
       transports.set(transport.sessionId, transport);
       console.error(`${clientId} connected (total: ${transports.size})`);

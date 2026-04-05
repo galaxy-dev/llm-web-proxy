@@ -6,14 +6,20 @@
 
 import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
-import type { Config } from "./types.js";
+import type { Config, ProviderConfig } from "./types.js";
+
+/** Default provider config */
+const DEFAULT_PROVIDER: ProviderConfig = {
+  enabled: true,
+};
 
 /** Default config, used when no config.json is provided */
 const DEFAULTS: Config = {
   port: 3210,
   headless: true,
-  provider: "chatgpt",
-  providerUrl: "",
+  providers: {
+    chatgpt: { ...DEFAULT_PROVIDER },
+  },
   maxSessions: 20,
   cdpPort: 9222,
   attachmentPrompt: "Please respond to the attached content.",
@@ -36,24 +42,36 @@ export function loadConfig(configPath?: string): Config {
 
   if (!existsSync(filePath)) {
     console.log(`No config.json found, using defaults (port ${DEFAULTS.port})`);
-    return DEFAULTS;
+    return { ...DEFAULTS, providers: { chatgpt: { ...DEFAULT_PROVIDER } } };
   }
 
   const raw = JSON.parse(readFileSync(filePath, "utf-8"));
 
-  // Backward compat: migrate chatgptUrl -> providerUrl
-  if (raw.chatgptUrl && !raw.providerUrl) {
-    console.warn('config: "chatgptUrl" is deprecated, use "providerUrl" instead');
-    raw.providerUrl = raw.chatgptUrl;
+  // Backward compat: migrate old single-provider format to providers map
+  if (!raw.providers && raw.provider) {
+    console.warn('config: "provider" is deprecated, use "providers" map instead');
+    const name = raw.provider as string;
+    const providerUrl = raw.chatgptUrl ?? raw.providerUrl;
+    raw.providers = {
+      [name]: { enabled: true, ...(providerUrl ? { providerUrl } : {}) },
+    };
+    delete raw.provider;
+    delete raw.providerUrl;
     delete raw.chatgptUrl;
   }
 
   const config: Config = {
     ...DEFAULTS,
     ...raw,
+    providers: raw.providers ?? { ...DEFAULTS.providers },
     timeouts: { ...DEFAULTS.timeouts, ...(raw.timeouts ?? {}) },
     account: { ...DEFAULTS.account, ...(raw.account ?? {}) },
   };
+
+  // Ensure each provider entry has defaults applied
+  for (const [name, prov] of Object.entries(config.providers)) {
+    config.providers[name] = { ...DEFAULT_PROVIDER, ...prov };
+  }
 
   validateConfig(config);
   return config;
@@ -72,6 +90,10 @@ function validateConfig(config: Config): void {
   }
   if (!config.account.name?.trim()) {
     throw new Error("config: account.name must be a non-empty string");
+  }
+  const enabledCount = Object.values(config.providers).filter((p) => p.enabled).length;
+  if (enabledCount === 0) {
+    throw new Error("config: at least one provider must be enabled");
   }
 }
 

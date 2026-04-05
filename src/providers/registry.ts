@@ -12,13 +12,14 @@ export interface ProviderPage {
   close(): Promise<void>;
 }
 
-/** Factory: given a Playwright Page and config, construct a ProviderPage */
-export type ProviderPageFactory = (page: Page, config: Config) => ProviderPage;
+/** Factory: given a Playwright Page, config, and resolved provider URL, construct a ProviderPage */
+export type ProviderPageFactory = (page: Page, config: Config, providerUrl: string) => ProviderPage;
 
 /** Check whether the browser is authenticated for this provider */
 export type AuthChecker = (
   context: BrowserContext,
   config: Config,
+  providerUrl: string,
 ) => Promise<boolean>;
 
 /** Detect whether a page URL indicates auth has expired */

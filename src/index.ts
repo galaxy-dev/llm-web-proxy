@@ -36,29 +36,99 @@ import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
 import { loadConfig } from "./config.js";
 import type { Config } from "./types.js";
-import { PROVIDERS } from "./providers/registry.js";
+import { PROVIDERS, type ProviderDefinition } from "./providers/registry.js";
+import type { ProviderRuntime } from "./session-manager.js";
 import "./providers/chatgpt/index.js";
 import { BrowserManager } from "./browser-manager.js";
 import { SessionManager } from "./session-manager.js";
 import { buildServer } from "./server.js";
 
+/** Resolve enabled providers from config, validating against the provider registry */
+function resolveEnabledProviders(config: Config): Map<string, ProviderDefinition> {
+  const enabled = new Map<string, ProviderDefinition>();
+  for (const [name, provConfig] of Object.entries(config.providers)) {
+    if (!provConfig.enabled) continue;
+    const provDef = PROVIDERS[name];
+    if (!provDef) {
+      throw new Error(`Unknown provider: "${name}". Available: ${Object.keys(PROVIDERS).join(", ")}`);
+    }
+    enabled.set(name, provDef);
+  }
+  if (enabled.size === 0) {
+    throw new Error("No enabled providers found in config");
+  }
+  return enabled;
+}
+
+/** Get the resolved URL for a provider (config override or provider default) */
+function getProviderUrl(config: Config, providerName: string, provDef: ProviderDefinition): string {
+  return config.providers[providerName]?.providerUrl || provDef.baseUrl;
+}
+
+/** Check auth for all providers, run parallel login flow for unauthenticated ones */
+async function ensureAllAuth(
+  config: Config,
+  browserManager: BrowserManager,
+  enabledProviders: Map<string, ProviderDefinition>,
+): Promise<void> {
+  // Check auth for all enabled providers in parallel
+  const authResults = await Promise.all(
+    [...enabledProviders.entries()].map(async ([name, provDef]) => {
+      const url = getProviderUrl(config, name, provDef);
+      const authed = await browserManager.checkProviderAuth(name, provDef.authChecker, url);
+      return { name, provDef, authed };
+    }),
+  );
+
+  const unauthenticated = authResults.filter((r) => !r.authed);
+  if (unauthenticated.length === 0) return;
+
+  console.log(`Auth needed for: ${unauthenticated.map((r) => r.name).join(", ")}`);
+
+  // Close headless browser, open visible browser for login
+  await browserManager.close();
+  await browserManager.loginFlowMulti(
+    unauthenticated.map((r) => ({
+      name: r.name,
+      baseUrl: getProviderUrl(config, r.name, r.provDef),
+    })),
+  );
+
+  // Relaunch headless browser and re-verify auth
+  await browserManager.launch();
+  for (const { name, provDef } of unauthenticated) {
+    const url = getProviderUrl(config, name, provDef);
+    const authed = await browserManager.checkProviderAuth(name, provDef.authChecker, url);
+    if (!authed) {
+      console.warn(`Warning: ${name} still not authenticated after login flow`);
+    }
+  }
+}
+
 /** Start the proxy service: init browser, verify login, start HTTP server; returns config for MCP layer */
 export async function startProxy(): Promise<Config> {
   const config = loadConfig();
+  const enabledProviders = resolveEnabledProviders(config);
 
-  const providerDef = PROVIDERS[config.provider];
-  if (!providerDef) {
-    throw new Error(`Unknown provider: "${config.provider}". Available: ${Object.keys(PROVIDERS).join(", ")}`);
+  const browserManager = new BrowserManager(config);
+
+  // Build provider runtimes for SessionManager
+  const providerRuntimes = new Map<string, ProviderRuntime>();
+  for (const [name, provDef] of enabledProviders) {
+    providerRuntimes.set(name, {
+      pageFactory: provDef.pageFactory,
+      authExpiredDetector: provDef.authExpiredDetector,
+      providerUrl: getProviderUrl(config, name, provDef),
+    });
   }
-  if (!config.providerUrl) config.providerUrl = providerDef.baseUrl;
 
-  const browserManager = new BrowserManager(config, providerDef.authChecker, config.providerUrl);
-  const sessionManager = new SessionManager(config, browserManager, providerDef.pageFactory, providerDef.authExpiredDetector);
+  const sessionManager = new SessionManager(config, browserManager, providerRuntimes);
 
   await browserManager.launch();
-  await browserManager.ensureAuth();
+  await ensureAllAuth(config, browserManager, enabledProviders);
 
-  const server = buildServer(sessionManager, browserManager);
+  const enabledNames = [...enabledProviders.keys()];
+  const server = buildServer(sessionManager, browserManager, enabledNames);
 
   // Graceful shutdown: close all sessions -> close browser -> stop HTTP server
   const shutdown = async () => {
@@ -80,9 +150,10 @@ export async function startProxy(): Promise<Config> {
   await server.listen({ port: config.port, host: "127.0.0.1" });
   console.log(`\nLLM Web Proxy ready on http://localhost:${config.port}`);
   console.log(`Account: ${config.account.name}`);
+  console.log(`Providers: ${enabledNames.join(", ")}`);
   console.log(`\nEndpoints:`);
-  console.log(`  GET    /health             - Health check`);
-  console.log(`  POST   /sessions           - Create session`);
+  console.log(`  GET    /health             - Health check (per-provider status)`);
+  console.log(`  POST   /sessions           - Create session (requires provider)`);
   console.log(`  GET    /sessions           - List sessions`);
   console.log(`  GET    /sessions/:id       - Get session`);
   console.log(`  POST   /sessions/:id/chat  - Send message`);
@@ -94,14 +165,16 @@ export async function startProxy(): Promise<Config> {
 async function main() {
   const args = process.argv.slice(2);
 
-  // "login" subcommand: launch visible browser for manual login
+  // "login" subcommand: launch visible browser for manual login of all enabled providers
   if (args[0] === "login") {
     const config = loadConfig();
-    const providerDef = PROVIDERS[config.provider];
-    if (!providerDef) throw new Error(`Unknown provider: "${config.provider}"`);
-    if (!config.providerUrl) config.providerUrl = providerDef.baseUrl;
-    const browserManager = new BrowserManager(config, providerDef.authChecker, config.providerUrl);
-    await browserManager.loginFlow();
+    const enabledProviders = resolveEnabledProviders(config);
+    const browserManager = new BrowserManager(config);
+
+    // Launch browser, check auth, login unauthenticated
+    await browserManager.launch();
+    await ensureAllAuth(config, browserManager, enabledProviders);
+    await browserManager.close();
     process.exit(0);
   }
 

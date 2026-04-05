@@ -1,6 +1,8 @@
 // HTTP API layer: Fastify-based RESTful endpoints for session management and messaging
 //
 // Thin routing layer; all business logic is delegated to SessionManager.
+// Supports multi-provider: POST /sessions requires provider in body,
+// GET /health returns per-provider auth status.
 // Unified error handler maps ProxyError to structured JSON responses (error + message).
 // RESPONSE_TIMEOUT additionally carries a partialResponse field.
 // Server binds to 127.0.0.1, local access only, no Authorization checks.
@@ -12,7 +14,11 @@ import type { ChatRequest } from "./types.js";
 import { ProxyError, ErrorCode } from "./errors.js";
 
 /** Build the Fastify HTTP server instance with all routes and error handling */
-export function buildServer(sessionManager: SessionManager, browserManager: BrowserManager) {
+export function buildServer(
+  sessionManager: SessionManager,
+  browserManager: BrowserManager,
+  enabledProviders: string[],
+) {
   const app = Fastify({ logger: true });
 
   // Unified error handler: ProxyError, validation errors, unknown errors
@@ -43,23 +49,41 @@ export function buildServer(sessionManager: SessionManager, browserManager: Brow
     };
   });
 
-  // --- Health check ---
-  app.get("/health", async () => ({
-    status: "ok",
-    authenticated: browserManager.authenticated,
-  }));
+  // --- Health check: returns per-provider auth status ---
+  app.get("/health", async () => {
+    const providers: Record<string, { authenticated: boolean }> = {};
+    for (const name of enabledProviders) {
+      providers[name] = {
+        authenticated: browserManager.isProviderAuthenticated(name),
+      };
+    }
+    return { status: "ok", providers };
+  });
 
   // --- List all sessions ---
   app.get("/sessions", async () => {
     return sessionManager.listSessions();
   });
 
-  // --- Create session ---
-  app.post("/sessions", async (_request, reply) => {
-    const session = await sessionManager.createSession();
+  // --- Create session (requires provider in body) ---
+  app.post<{
+    Body: { provider: string };
+  }>("/sessions", {
+    schema: {
+      body: {
+        type: "object",
+        required: ["provider"],
+        properties: {
+          provider: { type: "string", minLength: 1 },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    const session = await sessionManager.createSession(request.body.provider);
     reply.code(201);
     return {
       sessionId: session.id,
+      provider: session.provider,
       createdAt: session.createdAt.toISOString(),
     };
   });
