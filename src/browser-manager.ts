@@ -13,6 +13,7 @@ import { resolve, dirname } from "node:path";
 import { spawn, execFileSync, type ChildProcess } from "node:child_process";
 import type { Config } from "./types.js";
 import type { AuthChecker } from "./providers/registry.js";
+import { OperationQueue } from "./operation-queue.js";
 
 /** Common Chrome executable paths */
 const CHROME_CANDIDATES = [
@@ -31,6 +32,8 @@ export class BrowserManager {
   private reconnectListeners: Array<() => Promise<void>> = [];
   /** Deduplicates concurrent reconnect() calls — second caller awaits the same promise */
   private reconnectPromise: Promise<void> | null = null;
+  /** Serializes browser-interactive operations (page creation, paste, send) to prevent resource contention */
+  private browserQueue = new OperationQueue();
   /** Per-provider authentication status */
   private authStatuses = new Map<string, boolean>();
 
@@ -86,10 +89,10 @@ export class BrowserManager {
   }
 
   /**
-   * Launch real Chrome and connect via CDP.
-   * Uses real browser instead of Playwright's bundled one to avoid automation fingerprint detection.
+   * Launch real Chrome and connect via CDP, returning browser + child process.
+   * Does NOT write to instance fields — caller decides whether to store the process.
    */
-  private async launchChrome(headless: boolean): Promise<Browser> {
+  private async launchChromeDetached(headless: boolean): Promise<{ browser: Browser; process: ChildProcess }> {
     // Clean up Chrome processes that may have survived a previous crash
     this.killChrome();
     this.killChromeOnPort();
@@ -112,20 +115,21 @@ export class BrowserManager {
     ];
     if (headless) args.push("--headless=new");
 
-    this.chromeProcess = spawn(chromePath, args, { stdio: "ignore" });
+    const chromeProc = spawn(chromePath, args, { stdio: "ignore" });
 
-    this.chromeProcess.once("exit", (code) => {
+    chromeProc.once("exit", (code) => {
       if (code !== null && code !== 0) {
         console.error(`Chrome exited with code ${code}`);
       }
     });
 
-    const wsUrl = await this.waitForCDP();
+    const wsUrl = await this.waitForCDP(chromeProc);
 
     // Retry CDP connection up to 3 times
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
-        return await chromium.connectOverCDP(wsUrl);
+        const browser = await chromium.connectOverCDP(wsUrl);
+        return { browser, process: chromeProc };
       } catch (err) {
         if (attempt === 3) throw err;
         console.warn(`CDP connect attempt ${attempt} failed, retrying...`);
@@ -135,22 +139,35 @@ export class BrowserManager {
     throw new Error("unreachable");
   }
 
-  /** Poll until Chrome CDP port is ready, returns the WebSocket debugger URL */
-  private async waitForCDP(timeout = 10_000): Promise<string> {
+  /** Launch Chrome and store the process reference in instance fields */
+  private async launchChrome(headless: boolean): Promise<Browser> {
+    const result = await this.launchChromeDetached(headless);
+    this.chromeProcess = result.process;
+    return result.browser;
+  }
+
+  /** Poll until Chrome CDP port is ready, returns the WebSocket debugger URL.
+   *  @param chromeProc The spawned Chrome process to monitor for early exit */
+  private async waitForCDP(chromeProc: ChildProcess, timeout = 10_000): Promise<string> {
     const deadline = Date.now() + timeout;
     while (Date.now() < deadline) {
       // Fail fast if Chrome already exited
-      if (this.chromeProcess?.exitCode != null) {
-        throw new Error(`Chrome exited prematurely with code ${this.chromeProcess.exitCode}`);
+      if (chromeProc.exitCode != null) {
+        throw new Error(`Chrome exited prematurely with code ${chromeProc.exitCode}`);
       }
       try {
-        const res = await fetch(`http://127.0.0.1:${this.config.cdpPort}/json/version`);
+        const controller = new AbortController();
+        const fetchTimer = setTimeout(() => controller.abort(), 2000);
+        const res = await fetch(`http://127.0.0.1:${this.config.cdpPort}/json/version`, {
+          signal: controller.signal,
+        });
+        clearTimeout(fetchTimer);
         if (res.ok) {
           const json = (await res.json()) as { webSocketDebuggerUrl: string };
           return json.webSocketDebuggerUrl;
         }
       } catch {
-        // CDP not ready yet
+        // CDP not ready yet or fetch timed out
       }
       await new Promise((r) => setTimeout(r, 200));
     }
@@ -164,6 +181,13 @@ export class BrowserManager {
     console.log(`Chrome launched via CDP (headless: ${this.config.headless})`);
   }
 
+  /** Serialize a browser-interactive operation through the queue.
+   *  Only browser-touching work (page creation, navigation, text input, send button click)
+   *  should go through this queue. Response-waiting phases should run outside it. */
+  withBrowserLock<T>(fn: () => Promise<T>): Promise<T> {
+    return this.browserQueue.enqueue(fn);
+  }
+
   /** Get the shared browser context (auto-reconnects on disconnect) */
   async getContext(): Promise<BrowserContext> {
     if (this.context) {
@@ -174,7 +198,8 @@ export class BrowserManager {
         console.warn("Browser context lost, reconnecting...");
         this.context = null;
         await this.reconnect();
-        return this.context!;
+        if (!this.context) throw new Error("Reconnect succeeded but context is null");
+        return this.context;
       }
     }
     throw new Error("Browser not launched or context not initialized");
@@ -211,57 +236,61 @@ export class BrowserManager {
   ): Promise<void> {
     const account = this.config.account;
 
-    const browser = await this.launchChrome(false);
-    const context = browser.contexts()[0];
-    // Close Chrome's initial blank/chrome tabs
-    for (const p of context.pages()) {
-      const url = p.url();
-      if (url === "about:blank" || url.startsWith("chrome://newtab")) {
-        await p.close().catch(() => {});
+    // Use launchChromeDetached to avoid writing to this.chromeProcess,
+    // keeping the login browser fully isolated from the service browser lifecycle.
+    const { browser, process: chromeProc } = await this.launchChromeDetached(false);
+    try {
+      const context = browser.contexts()[0];
+      // Close Chrome's initial blank/chrome tabs
+      for (const p of context.pages()) {
+        const url = p.url();
+        if (url === "about:blank" || url.startsWith("chrome://newtab")) {
+          await p.close().catch(() => {});
+        }
+      }
+
+      // Open one tab per provider, navigating in parallel
+      console.log(`\nOpening login pages for: ${providers.map((p) => p.name).join(", ")}`);
+      await Promise.all(
+        providers.map(async (prov) => {
+          const page = await context.newPage();
+          console.log(`  ${prov.name}: ${prov.baseUrl}`);
+          await page.goto(prov.baseUrl, {
+            waitUntil: "domcontentloaded",
+            timeout: this.config.timeouts.navigation,
+          });
+        }),
+      );
+
+      console.log("\nPlease log in to all providers. Press Enter in the terminal when done.\n");
+
+      // Wait for the user to finish manual login and press Enter
+      await new Promise<void>((resolve) => {
+        process.stdin.resume();
+        process.stdin.once("data", () => {
+          process.stdin.pause();
+          resolve();
+        });
+      });
+
+      // Save storage state as a backup snapshot
+      const storagePath = resolve(account.storageStatePath);
+      const dir = dirname(storagePath);
+      if (!existsSync(dir)) {
+        mkdirSync(dir, { recursive: true });
+      }
+
+      await context.storageState({ path: storagePath });
+      console.log(`Storage state saved to ${storagePath}`);
+
+      await browser.close();
+    } finally {
+      // Ensure Chrome process is cleaned up even if login flow throws
+      if (chromeProc.exitCode == null) {
+        chromeProc.kill();
+        await new Promise<void>((r) => chromeProc.once("exit", r));
       }
     }
-
-    // Open one tab per provider, navigating in parallel
-    console.log(`\nOpening login pages for: ${providers.map((p) => p.name).join(", ")}`);
-    await Promise.all(
-      providers.map(async (prov) => {
-        const page = await context.newPage();
-        console.log(`  ${prov.name}: ${prov.baseUrl}`);
-        await page.goto(prov.baseUrl, {
-          waitUntil: "domcontentloaded",
-          timeout: this.config.timeouts.navigation,
-        });
-      }),
-    );
-
-    console.log("\nPlease log in to all providers. Press Enter in the terminal when done.\n");
-
-    // Wait for the user to finish manual login and press Enter
-    await new Promise<void>((resolve) => {
-      process.stdin.resume();
-      process.stdin.once("data", () => resolve());
-    });
-
-    // Save storage state as a backup snapshot
-    const storagePath = resolve(account.storageStatePath);
-    const dir = dirname(storagePath);
-    if (!existsSync(dir)) {
-      mkdirSync(dir, { recursive: true });
-    }
-
-    await context.storageState({ path: storagePath });
-    console.log(`Storage state saved to ${storagePath}`);
-
-    await browser.close();
-    // Wait for the login Chrome process to fully exit so profile data is flushed to disk.
-    // Use local reference instead of this.chromeProcess to avoid killing the wrong process
-    // if a concurrent launch() overwrites the field.
-    const loginProcess = this.chromeProcess;
-    if (loginProcess && loginProcess.exitCode == null) {
-      loginProcess.kill();
-      await new Promise<void>((r) => loginProcess.once("exit", r));
-    }
-    this.chromeProcess = null;
   }
 
   /** Reconnect after browser disconnection: restart Chrome and notify all listeners.

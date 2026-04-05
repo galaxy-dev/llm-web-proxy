@@ -9,7 +9,6 @@ import type { Config } from "../../types.js";
 import { ProxyError, ErrorCode } from "../../errors.js";
 import type { ProviderPageOptions } from "../registry.js";
 import { BaseProviderPage } from "../base-page.js";
-import { acquireClipboard, releaseClipboard } from "../../clipboard-mutex.js";
 
 /** Candidate selector lists for ChatGPT interactive elements */
 const SELECTOR_CANDIDATES = {
@@ -75,48 +74,27 @@ export class ChatGPTPage extends BaseProviderPage {
     await this.page.waitForTimeout(500);
   }
 
-  /** Send a message and wait for the ChatGPT reply; returns the reply text */
-  async sendMessage(text: string): Promise<string> {
-    // Record assistant message count before sending, to detect when a new reply appears
-    const beforeCount = await this.assistantMessages().count();
+  /** Input text, paste, click send — browser-interactive phase only.
+   *  Records beforeCount for awaitResponse (inherited from base class). */
+  async submitMessage(text: string): Promise<void> {
+    this.beforeCount = await this.assistantMessages().count();
+    this.lastMessageLength = text.length;
 
-    // Focus the input (ProseMirror needs focus and selection established first)
     const inputSel = await this.resolveSelector("messageInput");
     const input = this.page.locator(inputSel);
     await input.click();
 
     if (text.length > 2000 || text.includes("\n")) {
-      // Clipboard paste for long text or text with newlines (Enter triggers send in chat UIs)
-      await acquireClipboard();
-      try {
-        await this.page
-          .context()
-          .grantPermissions(["clipboard-read", "clipboard-write"]);
-        await this.page.evaluate(async (value) => {
-          await navigator.clipboard.writeText(value);
-        }, text);
-        const modifier = process.platform === "darwin" ? "Meta" : "Control";
-        await this.page.keyboard.press(`${modifier}+KeyV`);
+      await this.pasteViaClipboard(text);
 
-        // Clear clipboard after paste
-        await this.page
-          .evaluate(async () => navigator.clipboard.writeText(""))
-          .catch(() => {});
-      } finally {
-        releaseClipboard();
-      }
-
-      // After pasting long text, ChatGPT may convert it to a file attachment
       const attached = await this.waitForAttachment(10_000);
 
       if (attached) {
-        // Composer is cleared after attachment creation; fill in the prompt to enable sending
         await input.click();
         await input.pressSequentially(this.config.attachmentPrompt, {
           delay: 5,
         });
       } else {
-        // No attachment generated — verify text remains in the composer
         const composerText = await this.readComposerText(input);
         if (composerText.trim().length === 0) {
           throw new ProxyError(
@@ -126,32 +104,10 @@ export class ChatGPTPage extends BaseProviderPage {
         }
       }
     } else {
-      // Short text: type character-by-character to work around contenteditable fill() issues
       await input.pressSequentially(text, { delay: 5 });
     }
 
-    // Wait for the send button to become available and click it
     await this.waitUntilSendReadyAndSubmit();
-
-    // Wait for a new assistant message to appear
-    try {
-      await this.assistantMessages()
-        .nth(beforeCount)
-        .waitFor({
-          state: "visible",
-          timeout: this.config.timeouts.response,
-        });
-    } catch {
-      throw new ProxyError(
-        ErrorCode.PAGE_STRUCTURE_CHANGED,
-        "No new assistant message appeared — ChatGPT page structure may have changed"
-      );
-    }
-
-    // Wait for streaming response to finish (throws RESPONSE_TIMEOUT with partial reply on timeout)
-    await this.waitForResponseComplete();
-
-    return this.getLastAssistantMessage();
   }
 
   /** Wait for attachment element to appear after long text paste; returns whether it succeeded */

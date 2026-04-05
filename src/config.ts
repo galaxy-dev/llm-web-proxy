@@ -5,8 +5,12 @@
 // timeouts and account are deep-merged at two levels; users only need to override the fields they want.
 
 import { readFileSync, existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { resolve, dirname, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { Config, ProviderConfig } from "./types.js";
+
+/** Project root directory, anchored to this file's location (not process.cwd) */
+const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 /** Default provider config */
 const DEFAULT_PROVIDER: ProviderConfig = {
@@ -31,7 +35,8 @@ const DEFAULTS: Config = {
   },
   timeouts: {
     navigation: 30_000,
-    response: 120_000,
+    responseBase: 30_000,
+    responsePerKB: 2_000,
     stability: 2_000,
   },
   sseKeepaliveSec: 30,
@@ -97,10 +102,17 @@ function validateConfig(config: Config): void {
   if (enabledCount === 0) {
     throw new Error("config: at least one provider must be enabled");
   }
-  // Guard against path traversal in storageStatePath
-  const resolvedStorage = resolve(config.account.storageStatePath);
-  if (!resolvedStorage.startsWith(resolve("."))) {
-    throw new Error("config: account.storageStatePath must not escape the project directory");
+  // Validate provider URLs to prevent SSRF via file:// or internal addresses
+  for (const [name, prov] of Object.entries(config.providers)) {
+    if (prov.providerUrl && !prov.providerUrl.startsWith("https://")) {
+      throw new Error(`config: providers.${name}.providerUrl must use https:// (got "${prov.providerUrl}")`);
+    }
+  }
+  // Guard against path traversal in storageStatePath (anchored to project root, not CWD).
+  // Append path.sep to prevent prefix bypass (e.g. /project-evil matching /project).
+  const resolvedStorage = resolve(PROJECT_ROOT, config.account.storageStatePath);
+  if (!resolvedStorage.startsWith(PROJECT_ROOT + sep)) {
+    throw new Error(`config: account.storageStatePath must be within ${PROJECT_ROOT}`);
   }
 }
 

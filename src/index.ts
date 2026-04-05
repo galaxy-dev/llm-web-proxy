@@ -105,12 +105,22 @@ async function ensureAllAuth(
   }
 }
 
+/** Initialize browser and ensure all providers are authenticated */
+async function initBrowser(config: Config): Promise<{
+  browserManager: BrowserManager;
+  enabledProviders: Map<string, ProviderDefinition>;
+}> {
+  const enabledProviders = resolveEnabledProviders(config);
+  const browserManager = new BrowserManager(config);
+  await browserManager.launch();
+  await ensureAllAuth(config, browserManager, enabledProviders);
+  return { browserManager, enabledProviders };
+}
+
 /** Start the proxy service: init browser, verify login, start HTTP server; returns config for MCP layer */
 export async function startProxy(): Promise<Config> {
   const config = loadConfig();
-  const enabledProviders = resolveEnabledProviders(config);
-
-  const browserManager = new BrowserManager(config);
+  const { browserManager, enabledProviders } = await initBrowser(config);
 
   // Build provider runtimes for SessionManager
   const providerRuntimes = new Map<string, ProviderRuntime>();
@@ -124,9 +134,6 @@ export async function startProxy(): Promise<Config> {
   }
 
   const sessionManager = new SessionManager(config, browserManager, providerRuntimes);
-
-  await browserManager.launch();
-  await ensureAllAuth(config, browserManager, enabledProviders);
 
   const enabledNames = [...enabledProviders.keys()];
   const server = buildServer(sessionManager, browserManager, enabledNames);
@@ -166,15 +173,17 @@ export async function startProxy(): Promise<Config> {
 async function main() {
   const args = process.argv.slice(2);
 
-  // "login" subcommand: launch visible browser for manual login of all enabled providers
+  // "login" subcommand: force open visible browser for manual login of all providers
   if (args[0] === "login") {
     const config = loadConfig();
     const enabledProviders = resolveEnabledProviders(config);
     const browserManager = new BrowserManager(config);
-
-    // Launch browser, check auth, login unauthenticated
-    await browserManager.launch();
-    await ensureAllAuth(config, browserManager, enabledProviders);
+    await browserManager.loginFlowMulti(
+      [...enabledProviders.entries()].map(([name, provDef]) => ({
+        name,
+        baseUrl: getProviderUrl(config, name, provDef),
+      })),
+    );
     await browserManager.close();
     process.exit(0);
   }

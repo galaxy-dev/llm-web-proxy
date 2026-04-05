@@ -109,7 +109,7 @@ export function buildServer(
         type: "object",
         required: ["message"],
         properties: {
-          message: { type: "string", minLength: 1, maxLength: 100_000 },
+          message: { type: "string", minLength: 1, maxLength: 200_000 },
         },
       },
     },

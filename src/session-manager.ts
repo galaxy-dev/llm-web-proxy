@@ -179,20 +179,24 @@ export class SessionManager {
     const accountName = this.config.account.name;
 
     try {
+      // Only serialize page creation (newPage) through the browser queue.
+      // Navigation runs outside the queue so multiple sessions can navigate concurrently.
       let providerPage: ProviderPage | undefined;
       try {
-        const context = await this.browserManager.getContext();
-        const page = await context.newPage();
-        providerPage = runtime.pageFactory(page, this.config, {
-          providerUrl: runtime.providerUrl,
-          ephemeral: runtime.ephemeral,
+        providerPage = await this.browserManager.withBrowserLock(async () => {
+          const context = await this.browserManager.getContext();
+          const page = await context.newPage();
+          return runtime.pageFactory(page, this.config, {
+            providerUrl: runtime.providerUrl,
+            ephemeral: runtime.ephemeral,
+          });
         });
         await providerPage.navigateToNewChat();
       } catch (err: unknown) {
         // Check if auth expired and clean up the created page
         if (providerPage) {
           const url = providerPage.getPageUrl();
-          await providerPage.close();
+          await providerPage.close().catch(() => {});
           if (runtime.authExpiredDetector(url)) {
             this.browserManager.invalidateProviderAuth(providerName);
             throw new ProxyError(
@@ -218,7 +222,7 @@ export class SessionManager {
         createdAt: now,
         lastActivity: now,
         messageCount: 0,
-        providerPage,
+        providerPage: providerPage!,
         lock: new SessionLock(),
         closing: false,
         closed: false,
@@ -238,9 +242,7 @@ export class SessionManager {
   /** Send a message in the specified session and return the LLM reply */
   async sendMessage(sessionId: string, message: string): Promise<string> {
     const session = this.sessions.get(sessionId);
-    if (!session) {
-      this.throwNotFoundOrClosed(sessionId);
-    }
+    if (!session) return this.throwNotFoundOrClosed(sessionId);
 
     if (session.closing || session.closed) {
       throw new ProxyError(
@@ -252,8 +254,15 @@ export class SessionManager {
     // Serialize concurrent requests within the same session
     try {
       await session.lock.acquire();
-    } catch {
-      // Session was closed/drained while waiting
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("timeout")) {
+        console.error(`Session ${sessionId} lock timeout — possible deadlock`);
+        throw new ProxyError(
+          ErrorCode.BROWSER_ERROR,
+          `Session "${sessionId}" lock timeout — possible deadlock`
+        );
+      }
       throw new ProxyError(
         ErrorCode.SESSION_CLOSED,
         `Session "${sessionId}" is closing or already closed`
@@ -269,7 +278,12 @@ export class SessionManager {
         );
       }
 
-      const response = await session.providerPage.sendMessage(message);
+      // Phase 1: browser interaction (serialized through browser queue)
+      await this.browserManager.withBrowserLock(() =>
+        session.providerPage.submitMessage(message)
+      );
+      // Phase 2: wait for response (runs outside queue — multiple sessions can poll in parallel)
+      const response = await session.providerPage.awaitResponse();
       session.lastActivity = new Date();
       session.messageCount++;
       this.persistSession(session);
@@ -351,12 +365,16 @@ export class SessionManager {
     return [...live, ...stale];
   }
 
-  /** Close the specified session: drain lock queue, close page, clean up store */
+  /** Close the specified session: drain lock queue, close page, clean up store.
+   *  Idempotent — closing an already-closed or stale session is a no-op. */
   async closeSession(sessionId: string): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) {
-      this.throwNotFoundOrClosed(sessionId);
+      // Already removed or never existed — treat as success for idempotent DELETE
+      if (this.store.getById(sessionId)?.stale) return;
+      return this.throwNotFoundOrClosed(sessionId);
     }
+    if (session.closed) return;
 
     // Mark as closing — sendMessage pre-checks will reject requests early
     session.closing = true;

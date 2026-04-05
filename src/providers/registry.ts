@@ -7,6 +7,12 @@ import type { Config } from "../types.js";
 /** Minimal contract for a provider page handler */
 export interface ProviderPage {
   navigateToNewChat(): Promise<void>;
+  /** Input text, paste, click send — browser-interactive, should run under browser lock */
+  submitMessage(message: string): Promise<void>;
+  /** Wait for assistant reply after submission — DOM polling, safe to run in parallel.
+   *  @param timeout Response timeout in ms; scaled by message size when called from sendMessage. */
+  awaitResponse(timeout?: number): Promise<string>;
+  /** Convenience: submitMessage + awaitResponse in one call */
   sendMessage(message: string): Promise<string>;
   getPageUrl(): string;
   close(): Promise<void>;

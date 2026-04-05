@@ -77,29 +77,33 @@ export class SessionStore {
     return JSON.stringify(data, null, 2);
   }
 
-  /** Schedule a debounced disk write, coalescing multiple changes into a single I/O */
+  /** Schedule a debounced disk write, coalescing multiple changes into a single I/O.
+   *  Skips scheduling when an async flush is already in progress — the flush's
+   *  .finally() handler will re-check dirty and schedule another round if needed. */
   private scheduleFlush(): void {
     this.dirty = true;
-    if (this.flushTimer) return;
+    if (this.flushTimer || this.flushPromise) return;
     this.flushTimer = setTimeout(() => {
       this.flushTimer = null;
       this.flushPromise = this.flushAsync().finally(() => {
         this.flushPromise = null;
-        // If new writes arrived during flush, schedule another
         if (this.dirty) this.scheduleFlush();
       });
     }, DEBOUNCE_MS);
   }
 
-  /** Async disk write: write to temp file then atomic rename to prevent corruption */
+  /** Async disk write: write to temp file then atomic rename to prevent corruption.
+   *  Snapshot-and-clear pattern: dirty is cleared and data serialized before async work,
+   *  so any save() during the write correctly re-arms dirty for the next flush round. */
   private async flushAsync(): Promise<void> {
     this.dirty = false;
+    const snapshot = this.toSerializable();
     const dir = dirname(STORE_PATH);
     if (!existsSync(dir)) {
       await mkdir(dir, { recursive: true });
     }
     const tmpPath = STORE_PATH + ".tmp";
-    await writeFile(tmpPath, this.toSerializable());
+    await writeFile(tmpPath, snapshot);
     await rename(tmpPath, STORE_PATH);
   }
 

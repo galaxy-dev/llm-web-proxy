@@ -25,7 +25,7 @@ const PROXY_URL = process.env.LLM_WEB_PROXY_URL ?? "http://localhost:3210";
 /** Populated by main() after config is loaded */
 let SSE_KEEPALIVE_INTERVAL_MS = 30_000;
 let ORPHAN_GRACE_PERIOD_MS = 14_400_000;
-/** Enabled provider names, populated at startup */
+/** Enabled provider names, set once by main() before any connections are accepted */
 let ENABLED_PROVIDERS: string[] = [];
 
 /** Sessions orphaned by a disconnected SSE connection, awaiting adoption or deletion */
@@ -111,16 +111,17 @@ async function parseOrError<T>(
   return { data };
 }
 
-/** Register all MCP tools on the given server instance, scoped to ownedSessions */
-function registerTools(server: McpServer, ownedSessions: Set<string>, clientId: string) {
-  const providerEnum = z.enum(ENABLED_PROVIDERS as [string, ...string[]]);
+/** Register all MCP tools on the given server instance, scoped to ownedSessions.
+ *  providers is passed explicitly to avoid depending on module-level mutable state timing. */
+function registerTools(server: McpServer, ownedSessions: Set<string>, clientId: string, providers: string[]) {
+  const providerEnum = z.enum(providers as [string, ...string[]]);
 
   // List available providers
   server.tool(
     "provider_list",
     "List all available LLM providers.",
     {},
-    async () => mcpText(JSON.stringify(ENABLED_PROVIDERS)),
+    async () => mcpText(JSON.stringify(providers)),
   );
 
   // Health check: returns per-provider status
@@ -158,6 +159,8 @@ function registerTools(server: McpServer, ownedSessions: Set<string>, clientId: 
       );
       if ("error" in createResult) return createResult.error;
       const { sessionId } = createResult.data;
+      // Track for orphan cleanup if SSE disconnects before DELETE completes
+      ownedSessions.add(sessionId);
 
       try {
         const chatResult = await parseOrError<{ response: string }>(
@@ -171,6 +174,7 @@ function registerTools(server: McpServer, ownedSessions: Set<string>, clientId: 
         if ("error" in chatResult) return chatResult.error;
         return mcpText(chatResult.data.response);
       } finally {
+        ownedSessions.delete(sessionId);
         await api(`/sessions/${sessionId}`, { method: "DELETE" }).catch(() => {});
       }
     }
@@ -285,7 +289,7 @@ function createMcpServer(clientId: string): { server: McpServer; ownedSessions: 
     version: "0.1.0",
   });
   const ownedSessions = new Set<string>();
-  registerTools(server, ownedSessions, clientId);
+  registerTools(server, ownedSessions, clientId, ENABLED_PROVIDERS);
   return { server, ownedSessions };
 }
 
@@ -380,6 +384,14 @@ async function main() {
     res.writeHead(404);
     res.end();
   });
+
+  // Clean up orphan timers on shutdown to allow clean process exit
+  const cleanupOrphans = () => {
+    for (const { timer } of orphanPool.values()) clearTimeout(timer);
+    orphanPool.clear();
+  };
+  process.on("SIGINT", cleanupOrphans);
+  process.on("SIGTERM", cleanupOrphans);
 
   httpServer.listen(port, "127.0.0.1", () => {
     console.error(`MCP server (SSE) listening on http://127.0.0.1:${port}/sse`);

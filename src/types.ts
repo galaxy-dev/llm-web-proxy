@@ -32,8 +32,10 @@ export interface Config {
   attachmentPrompt: string;
   timeouts: {
     navigation: number;
-    /** Timeout for waiting for LLM response */
-    response: number;
+    /** Base timeout (ms) for waiting for LLM response, before message-size scaling */
+    responseBase: number;
+    /** Additional timeout (ms) per KB of input message; scales with message size */
+    responsePerKB: number;
     /** Wait time to confirm response text has stabilized (stopped changing) */
     stability: number;
   };

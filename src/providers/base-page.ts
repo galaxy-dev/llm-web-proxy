@@ -9,6 +9,7 @@ import type { Page } from "playwright";
 import type { Config } from "../types.js";
 import { ProxyError, ErrorCode } from "../errors.js";
 import type { ProviderPage, ProviderPageOptions } from "./registry.js";
+import { acquireClipboard, releaseClipboard } from "../clipboard-mutex.js";
 
 /** Candidate selector lists keyed by role (e.g. messageInput, sendButton, stopButton) */
 export type SelectorCandidates = Record<string, string[]>;
@@ -34,8 +35,74 @@ export abstract class BaseProviderPage implements ProviderPage {
     this.ephemeral = options.ephemeral;
   }
 
-  abstract sendMessage(text: string): Promise<string>;
+  /** Assistant message count before the current submission, used by awaitResponse */
+  protected beforeCount = 0;
+  /** Length of the last submitted message, used to calculate response timeout */
+  protected lastMessageLength = 0;
+
+  /** Input text, paste, click send — browser-interactive phase only */
+  abstract submitMessage(text: string): Promise<void>;
   abstract navigateToNewChat(): Promise<void>;
+
+  /** Calculate response timeout based on message size: base + perKB * messageKB */
+  protected calcResponseTimeout(messageLength: number): number {
+    const { responseBase, responsePerKB } = this.config.timeouts;
+    return responseBase + responsePerKB * Math.ceil(messageLength / 1024);
+  }
+
+  /** Convenience: submitMessage + awaitResponse in one call */
+  async sendMessage(text: string): Promise<string> {
+    await this.submitMessage(text);
+    return this.awaitResponse(this.calcResponseTimeout(text.length));
+  }
+
+  /** Wait for assistant reply after submission — DOM polling, safe to run in parallel.
+   *  @param timeout Response timeout in ms; if omitted, auto-scales based on last submitted message size. */
+  async awaitResponse(timeout?: number): Promise<string> {
+    const responseTimeout = timeout ?? this.calcResponseTimeout(this.lastMessageLength);
+    try {
+      await this.assistantMessages()
+        .nth(this.beforeCount)
+        .waitFor({
+          state: "visible",
+          timeout: responseTimeout,
+        });
+    } catch (err: unknown) {
+      if (err instanceof Error && err.name === "TimeoutError") {
+        throw new ProxyError(
+          ErrorCode.RESPONSE_TIMEOUT,
+          "No new assistant message appeared within timeout",
+        );
+      }
+      throw new ProxyError(
+        ErrorCode.PAGE_STRUCTURE_CHANGED,
+        "No new assistant message appeared — page structure may have changed",
+      );
+    }
+
+    await this.waitForResponseComplete(responseTimeout);
+    return this.getLastAssistantMessage();
+  }
+
+  /** Paste text via system clipboard with global mutex to prevent concurrent overwrites */
+  protected async pasteViaClipboard(text: string): Promise<void> {
+    await acquireClipboard();
+    try {
+      await this.page
+        .context()
+        .grantPermissions(["clipboard-read", "clipboard-write"]);
+      await this.page.evaluate(async (value) => {
+        await navigator.clipboard.writeText(value);
+      }, text);
+      const modifier = process.platform === "darwin" ? "Meta" : "Control";
+      await this.page.keyboard.press(`${modifier}+KeyV`);
+      await this.page
+        .evaluate(async () => navigator.clipboard.writeText(""))
+        .catch(() => {});
+    } finally {
+      releaseClipboard();
+    }
+  }
 
   /**
    * Resolve a visible interactive element selector from the candidate list and cache it.
@@ -114,9 +181,8 @@ export abstract class BaseProviderPage implements ProviderPage {
    * Wait for streaming response to complete: stop button disappears, then text stability check.
    * Uses wall-clock timestamps for stability measurement to avoid polling-interval drift.
    */
-  protected async waitForResponseComplete(): Promise<void> {
-    const { response: responseTimeout, stability: stabilityMs } =
-      this.config.timeouts;
+  protected async waitForResponseComplete(responseTimeout: number): Promise<void> {
+    const { stability: stabilityMs } = this.config.timeouts;
     const deadline = Date.now() + responseTimeout;
     const checkInterval = 500;
     const stopSel = this.stopButtonCombinedSelector();
@@ -174,11 +240,11 @@ export abstract class BaseProviderPage implements ProviderPage {
       await this.page.waitForTimeout(checkInterval);
     }
 
-    const partialText = await this.getLastAssistantMessage();
+    // Use the last polled text instead of an extra DOM read — page may have navigated away
     throw new ProxyError(
       ErrorCode.RESPONSE_TIMEOUT,
       "Timed out waiting for response",
-      partialText || undefined,
+      lastText || undefined,
     );
   }
 
