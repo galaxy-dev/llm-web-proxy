@@ -1,11 +1,11 @@
-// 统一错误处理：错误码枚举、HTTP 状态码映射、自定义异常类
+// Unified error handling: error code enum, HTTP status mapping, custom exception class
 //
-// 所有业务错误通过 ProxyError 抛出，携带 ErrorCode 枚举值。
-// ErrorCode → HTTP 状态码为固定映射，server.ts 的错误处理器据此生成响应。
-// RESPONSE_TIMEOUT 场景下 partialResponse 携带已收到的部分回复，
-// 避免长时间等待后完全丢失结果。
+// All business errors are thrown via ProxyError with an ErrorCode enum value.
+// ErrorCode maps to HTTP status codes; the server.ts error handler generates responses accordingly.
+// In RESPONSE_TIMEOUT scenarios, partialResponse carries the already-received partial reply,
+// preventing total loss of results after long waits.
 
-/** 业务错误码，每个码对应一个 HTTP 状态码 */
+/** Business error codes, each mapped to an HTTP status code */
 export enum ErrorCode {
   SESSION_NOT_FOUND = "SESSION_NOT_FOUND",
   SESSION_CLOSED = "SESSION_CLOSED",
@@ -17,7 +17,7 @@ export enum ErrorCode {
   BAD_REQUEST = "BAD_REQUEST",
 }
 
-/** 错误码到 HTTP 状态码的映射 */
+/** Error code to HTTP status code mapping */
 const HTTP_STATUS: Record<ErrorCode, number> = {
   [ErrorCode.SESSION_NOT_FOUND]: 404,
   [ErrorCode.SESSION_CLOSED]: 410,
@@ -29,11 +29,11 @@ const HTTP_STATUS: Record<ErrorCode, number> = {
   [ErrorCode.BAD_REQUEST]: 400,
 };
 
-/** 带业务语义的代理错误，包含错误码、HTTP 状态码和可选的部分响应 */
+/** Business-semantic proxy error with error code, HTTP status, and optional partial response */
 export class ProxyError extends Error {
   readonly code: ErrorCode;
   readonly httpStatus: number;
-  /** 超时场景下可能已收到的部分回复 */
+  /** Partial reply that may have been received before timeout */
   readonly partialResponse?: string;
 
   constructor(code: ErrorCode, message: string, partialResponse?: string) {

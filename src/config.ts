@@ -1,14 +1,14 @@
-// 配置加载与校验：从 config.json 读取配置，合并默认值并验证
+// Config loading and validation: reads config.json, merges with defaults, and validates
 //
-// 加载策略：DEFAULTS 提供完整默认值 → config.json 覆盖 → validateConfig 校验。
-// 无 config.json 时使用全默认值即可运行，降低首次使用门槛。
-// timeouts 和 account 做二级深度合并，用户只需覆盖想改的字段。
+// Loading strategy: DEFAULTS provides full defaults -> config.json overrides -> validateConfig validates.
+// Runs with all defaults when config.json is absent, lowering the barrier for first-time use.
+// timeouts and account are deep-merged at two levels; users only need to override the fields they want.
 
 import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 import type { Config } from "./types.js";
 
-/** 默认配置，未提供 config.json 时使用 */
+/** Default config, used when no config.json is provided */
 const DEFAULTS: Config = {
   port: 3210,
   headless: true,
@@ -19,7 +19,7 @@ const DEFAULTS: Config = {
   attachmentPrompt: "Please respond to the attached content.",
   account: {
     name: "default",
-    storageStatePath: "./.chatgpt-proxy/accounts/default.json",
+    storageStatePath: "./.llm-web-proxy/accounts/default.json",
   },
   timeouts: {
     navigation: 30_000,
@@ -30,7 +30,7 @@ const DEFAULTS: Config = {
   orphanGraceSec: 14_400,
 };
 
-/** 加载配置文件，与默认值深度合并后返回 */
+/** Load config file, deep-merge with defaults, and return */
 export function loadConfig(configPath?: string): Config {
   const filePath = configPath ?? resolve(process.cwd(), "config.json");
 
@@ -41,7 +41,7 @@ export function loadConfig(configPath?: string): Config {
 
   const raw = JSON.parse(readFileSync(filePath, "utf-8"));
 
-  // Backward compat: migrate chatgptUrl → providerUrl
+  // Backward compat: migrate chatgptUrl -> providerUrl
   if (raw.chatgptUrl && !raw.providerUrl) {
     console.warn('config: "chatgptUrl" is deprecated, use "providerUrl" instead');
     raw.providerUrl = raw.chatgptUrl;
@@ -59,7 +59,7 @@ export function loadConfig(configPath?: string): Config {
   return config;
 }
 
-/** 校验配置项合法性 */
+/** Validate config fields */
 function validateConfig(config: Config): void {
   assertPort("port", config.port);
   assertPort("cdpPort", config.cdpPort);

@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "chatgpt-proxy": {
+    "llm-web-proxy": {
       "type": "sse",
       "url": "http://localhost:3211/sse"
     }

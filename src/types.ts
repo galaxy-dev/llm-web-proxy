@@ -1,12 +1,12 @@
-// 全局类型定义：配置、会话、请求/响应的接口
+// Global type definitions: interfaces for config, sessions, and request/response
 //
-// 作为各模块间的契约层，所有跨模块传递的数据结构在此统一定义。
-// SessionInfo 是对外暴露的会话视图，不包含内部实现细节（如 Page 句柄、锁）。
-// SessionStatus 涵盖完整生命周期：active → closing → stale/error。
+// Serves as the contract layer between modules; all cross-module data structures are defined here.
+// SessionInfo is the public session view, excluding internal details (e.g. Page handles, locks).
+// SessionStatus covers the full lifecycle: active -> closing -> stale/error.
 
 export interface AccountConfig {
   name: string;
-  /** 浏览器存储状态的备份路径 */
+  /** Backup path for browser storage state */
   storageStatePath: string;
 }
 
@@ -18,21 +18,21 @@ export interface Config {
   /** Provider base URL (resolved from provider definition if not set) */
   providerUrl: string;
   maxSessions: number;
-  /** Chrome 远程调试端口 */
+  /** Chrome remote debugging port */
   cdpPort: number;
   account: AccountConfig;
-  /** 长文本粘贴转附件后，自动填入的提示语 */
+  /** Prompt auto-filled after long text is converted to an attachment */
   attachmentPrompt: string;
   timeouts: {
     navigation: number;
-    /** 等待 ChatGPT 回复的超时时间 */
+    /** Timeout for waiting for LLM response */
     response: number;
-    /** 判定回复文本稳定（不再变化）的等待时间 */
+    /** Wait time to confirm response text has stabilized (stopped changing) */
     stability: number;
   };
-  /** SSE 心跳间隔（秒），防止空闲超时断连 */
+  /** SSE keepalive interval in seconds, prevents idle timeout disconnects */
   sseKeepaliveSec: number;
-  /** SSE 断连后 session 保留的宽限期（秒），超时未认领则删除 */
+  /** Grace period in seconds for orphaned sessions after SSE disconnect; deleted if unclaimed */
   orphanGraceSec: number;
 }
 

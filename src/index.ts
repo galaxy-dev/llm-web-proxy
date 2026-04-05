@@ -1,34 +1,34 @@
-// 应用入口：启动代理服务或执行登录流程
+// Application entry point: starts the proxy server or runs the login flow
 //
 // ============================================================================
-// ⚠️  以下设计决策为 v1 有意为之 (INTENTIONAL)，请勿在 review 中重复提出  ⚠️
+// The following design decisions are INTENTIONAL for v1; do not re-raise in reviews.
 // ============================================================================
 //
-// 1. 无 idle session 自动回收
-//    会话仅在显式 DELETE 或进程退出时关闭。v1 scope 不做定时清理。
-//    理由：当前使用场景为 AI 互审工作流，会话生命周期由调用方管理。
+// 1. No idle session auto-reclaim
+//    Sessions are only closed on explicit DELETE or process exit. No scheduled cleanup in v1.
+//    Rationale: current use case is AI cross-review workflows; session lifecycle is caller-managed.
 //
 //
-// 3. reconnect listener 失败仅记录日志
-//    浏览器重连后 listener 执行失败不会阻断恢复流程，也不会回滚。
-//    理由：将恢复改为事务语义代价过大，当前日志记录足够排障。
+// 3. Reconnect listener failures are logged only
+//    Listener failures after browser reconnection do not block recovery or trigger rollback.
+//    Rationale: making recovery transactional is too costly; logging is sufficient for debugging.
 //
-// 4. 无 API 访问控制 / Token 验证
-//    服务绑定 127.0.0.1，不做 Authorization header 校验。
-//    理由：仅本机访问，不暴露到网络。
+// 4. No API access control / token verification
+//    Server binds to 127.0.0.1 with no Authorization header checks.
+//    Rationale: local access only, not exposed to the network.
 //
-// 5. 单账号架构
-//    config 中使用单一 account 对象，不支持多账号池化/调度/健康追踪。
-//    理由：v1 scope 明确排除多账号，详见 memory/project_multi_account_rationale.md。
+// 5. Single-account architecture
+//    Config uses a single account object; no multi-account pooling/scheduling/health tracking.
+//    Rationale: multi-account is explicitly out of v1 scope, see memory/project_multi_account_rationale.md.
 //
-// 6. 时间字段命名未统一
-//    createdAt / lastActivity / savedAt 混用 At 后缀和无后缀风格。
-//    理由：不影响功能，纯风格问题，不值得一次性全量重命名的 churn。
+// 6. Inconsistent time field naming
+//    createdAt / lastActivity / savedAt mix "At" suffix and no-suffix styles.
+//    Rationale: no functional impact; pure style issue, not worth a full-rename churn.
 //
-// 7. closing 状态语义较宽
-//    SessionStatus 中 "closing" 同时覆盖用户主动关闭和 reconnect invalidation
-//    初始阶段，未细分为独立子状态。
-//    理由：当前 closing 窗口极短，细分子状态的 API 收益不大。
+// 7. Broad "closing" state semantics
+//    SessionStatus "closing" covers both user-initiated close and reconnect invalidation
+//    in the initial phase, without distinct sub-states.
+//    Rationale: closing window is very short; splitting into sub-states offers little API benefit.
 //
 // ============================================================================
 
@@ -42,7 +42,7 @@ import { BrowserManager } from "./browser-manager.js";
 import { SessionManager } from "./session-manager.js";
 import { buildServer } from "./server.js";
 
-/** 启动代理服务：初始化浏览器、验证登录、启动 HTTP 服务，返回配置供 MCP 层使用 */
+/** Start the proxy service: init browser, verify login, start HTTP server; returns config for MCP layer */
 export async function startProxy(): Promise<Config> {
   const config = loadConfig();
 
@@ -60,7 +60,7 @@ export async function startProxy(): Promise<Config> {
 
   const server = buildServer(sessionManager, browserManager);
 
-  // 优雅关闭：关闭所有会话 -> 关闭浏览器 -> 停止 HTTP 服务
+  // Graceful shutdown: close all sessions -> close browser -> stop HTTP server
   const shutdown = async () => {
     console.log("\nShutting down...");
     await sessionManager.closeAll();
@@ -78,7 +78,7 @@ export async function startProxy(): Promise<Config> {
   });
 
   await server.listen({ port: config.port, host: "127.0.0.1" });
-  console.log(`\nChatGPT Proxy ready on http://localhost:${config.port}`);
+  console.log(`\nLLM Web Proxy ready on http://localhost:${config.port}`);
   console.log(`Account: ${config.account.name}`);
   console.log(`\nEndpoints:`);
   console.log(`  GET    /health             - Health check`);
@@ -94,7 +94,7 @@ export async function startProxy(): Promise<Config> {
 async function main() {
   const args = process.argv.slice(2);
 
-  // login 子命令：启动可视浏览器进行手动登录
+  // "login" subcommand: launch visible browser for manual login
   if (args[0] === "login") {
     const config = loadConfig();
     const providerDef = PROVIDERS[config.provider];
@@ -113,7 +113,7 @@ async function main() {
   }
 }
 
-// 仅作为入口文件直接运行时执行 main()，被 import 时不执行
+// Only run main() when executed as the entry file; skip when imported
 const isDirectRun =
   process.argv[1] &&
   resolve(process.argv[1]) === fileURLToPath(import.meta.url);

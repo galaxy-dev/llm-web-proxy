@@ -1,9 +1,9 @@
-// HTTP API 层：基于 Fastify 的 RESTful 接口，提供会话管理和消息收发端点
+// HTTP API layer: Fastify-based RESTful endpoints for session management and messaging
 //
-// 薄路由层，业务逻辑全部委托给 SessionManager。
-// 统一错误处理器将 ProxyError 映射为结构化 JSON 响应（error + message），
-// RESPONSE_TIMEOUT 额外携带 partialResponse 字段。
-// 服务绑定 127.0.0.1，仅本机访问，不做 Authorization 校验。
+// Thin routing layer; all business logic is delegated to SessionManager.
+// Unified error handler maps ProxyError to structured JSON responses (error + message).
+// RESPONSE_TIMEOUT additionally carries a partialResponse field.
+// Server binds to 127.0.0.1, local access only, no Authorization checks.
 
 import Fastify from "fastify";
 import type { BrowserManager } from "./browser-manager.js";
@@ -11,11 +11,11 @@ import type { SessionManager } from "./session-manager.js";
 import type { ChatRequest } from "./types.js";
 import { ProxyError, ErrorCode } from "./errors.js";
 
-/** 构建 Fastify HTTP 服务实例，注册所有路由和错误处理 */
+/** Build the Fastify HTTP server instance with all routes and error handling */
 export function buildServer(sessionManager: SessionManager, browserManager: BrowserManager) {
   const app = Fastify({ logger: true });
 
-  // 统一错误处理：ProxyError、校验错误、未知错误
+  // Unified error handler: ProxyError, validation errors, unknown errors
   app.setErrorHandler<Error>(function (err, _request, reply) {
     if (err instanceof ProxyError) {
       reply.code(err.httpStatus);
@@ -43,18 +43,18 @@ export function buildServer(sessionManager: SessionManager, browserManager: Brow
     };
   });
 
-  // --- 健康检查 ---
+  // --- Health check ---
   app.get("/health", async () => ({
     status: "ok",
     authenticated: browserManager.authenticated,
   }));
 
-  // --- 列出所有会话 ---
+  // --- List all sessions ---
   app.get("/sessions", async () => {
     return sessionManager.listSessions();
   });
 
-  // --- 创建会话 ---
+  // --- Create session ---
   app.post("/sessions", async (_request, reply) => {
     const session = await sessionManager.createSession();
     reply.code(201);
@@ -64,7 +64,7 @@ export function buildServer(sessionManager: SessionManager, browserManager: Brow
     };
   });
 
-  // --- 查询会话详情 ---
+  // --- Get session details ---
   app.get<{
     Params: { id: string };
   }>("/sessions/:id", async (request) => {
@@ -75,7 +75,7 @@ export function buildServer(sessionManager: SessionManager, browserManager: Brow
     return session;
   });
 
-  // --- 发送消息 ---
+  // --- Send message ---
   app.post<{
     Params: { id: string };
     Body: ChatRequest;
@@ -100,7 +100,7 @@ export function buildServer(sessionManager: SessionManager, browserManager: Brow
     };
   });
 
-  // --- 关闭会话 ---
+  // --- Close session ---
   app.delete<{
     Params: { id: string };
   }>("/sessions/:id", async (request, reply) => {

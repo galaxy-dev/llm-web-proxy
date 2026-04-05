@@ -1,9 +1,10 @@
-// 会话持久化存储：将会话元数据异步写入 JSON 文件，支持优雅关闭时同步刷盘
+// Session persistence store: async writes session metadata to a JSON file, with sync flush on shutdown
 //
-// 内存 Map 为权威数据源，磁盘文件为快照。写盘采用去抖合并（200ms）减少 I/O，
-// 写入时先写 .tmp 再原子 rename，防止写到一半崩溃导致数据损坏。
-// 进程退出时 flushSync() 同步刷盘确保数据不丢。
-// 进程重启后加载的会话统一标记为 stale（Page 句柄已失效），供 API 层查询历史。
+// In-memory Map is the authoritative data source; disk file is a snapshot.
+// Writes use debounced coalescing (200ms) to reduce I/O.
+// Writes go to a .tmp file first, then atomic rename, to prevent corruption from mid-write crashes.
+// flushSync() on process exit ensures data is persisted before shutdown.
+// Sessions loaded after restart are marked as stale (Page handles are no longer valid) for API history queries.
 
 import {
   readFileSync,
@@ -15,22 +16,22 @@ import {
 import { writeFile, rename, mkdir } from "node:fs/promises";
 import { resolve, dirname } from "node:path";
 
-/** 持久化到磁盘的会话数据结构 */
+/** Session data structure persisted to disk */
 export interface PersistedSession {
   id: string;
   accountName: string;
   createdAt: string;
   lastActivity: string;
   messageCount: number;
-  /** 进程重启后原有会话的 Page 句柄已失效，标记为 stale */
+  /** After process restart, Page handles from prior sessions are invalid; marked as stale */
   stale: boolean;
 }
 
-const STORE_PATH = resolve("./.chatgpt-proxy/sessions.json");
-/** 写入去抖间隔，合并高频写操作为单次 I/O */
+const STORE_PATH = resolve("./.llm-web-proxy/sessions.json");
+/** Debounce interval for write coalescing, merging frequent writes into a single I/O */
 const DEBOUNCE_MS = 200;
 
-/** 会话持久化存储，内存 Map 为权威数据源，异步去抖写盘 */
+/** Session persistence store; in-memory Map is authoritative, with async debounced disk writes */
 export class SessionStore {
   private sessions = new Map<string, PersistedSession>();
   private dirty = false;
@@ -41,19 +42,19 @@ export class SessionStore {
     this.load();
   }
 
-  /** 从磁盘加载会话，所有加载的会话标记为 stale（Page 句柄已失效） */
+  /** Load sessions from disk; all loaded sessions are marked stale (Page handles are invalid) */
   private load(): void {
     if (!existsSync(STORE_PATH)) return;
 
     try {
       const raw = readFileSync(STORE_PATH, "utf-8");
       const data = JSON.parse(raw) as { sessions: PersistedSession[] };
-      // 进程重启后 Page 句柄丢失，统一标记为 stale
+      // Page handles are lost after restart; mark all as stale
       for (const session of data.sessions) {
         session.stale = true;
         this.sessions.set(session.id, session);
       }
-      // 立即将 stale 状态写盘，确保文件反映真实状态
+      // Write stale status to disk immediately to reflect true state
       if (this.sessions.size > 0) {
         this.scheduleFlush();
       }
@@ -62,7 +63,7 @@ export class SessionStore {
     }
   }
 
-  /** 序列化为 JSON 字符串 */
+  /** Serialize to JSON string */
   private toSerializable(): string {
     const data = {
       sessions: Array.from(this.sessions.values()),
@@ -71,7 +72,7 @@ export class SessionStore {
     return JSON.stringify(data, null, 2);
   }
 
-  /** 调度一次去抖写盘，合并短时间内的多次变更为单次 I/O */
+  /** Schedule a debounced disk write, coalescing multiple changes into a single I/O */
   private scheduleFlush(): void {
     this.dirty = true;
     if (this.flushTimer) return;
@@ -79,13 +80,13 @@ export class SessionStore {
       this.flushTimer = null;
       this.flushPromise = this.flushAsync().finally(() => {
         this.flushPromise = null;
-        // 刷盘期间若有新写入，再调度一次
+        // If new writes arrived during flush, schedule another
         if (this.dirty) this.scheduleFlush();
       });
     }, DEBOUNCE_MS);
   }
 
-  /** 异步写盘：先写临时文件再原子重命名，避免写到一半崩溃导致数据损坏 */
+  /** Async disk write: write to temp file then atomic rename to prevent corruption */
   private async flushAsync(): Promise<void> {
     this.dirty = false;
     const dir = dirname(STORE_PATH);
@@ -98,8 +99,8 @@ export class SessionStore {
   }
 
   /**
-   * 同步写盘 — 仅在进程关闭时使用，确保数据在退出前落盘。
-   * 无条件写入，覆盖可能正在进行的异步刷盘。
+   * Sync disk write — used only during process shutdown to ensure data is persisted before exit.
+   * Writes unconditionally, overriding any in-progress async flush.
    */
   flushSync(): void {
     if (this.flushTimer) {
@@ -117,13 +118,13 @@ export class SessionStore {
     renameSync(tmpPath, STORE_PATH);
   }
 
-  /** 保存或更新一条会话记录 */
+  /** Save or update a session record */
   save(session: PersistedSession): void {
     this.sessions.set(session.id, session);
     this.scheduleFlush();
   }
 
-  /** 删除一条会话记录 */
+  /** Remove a session record */
   remove(sessionId: string): void {
     this.sessions.delete(sessionId);
     this.scheduleFlush();
@@ -137,7 +138,7 @@ export class SessionStore {
     return Array.from(this.sessions.values());
   }
 
-  /** 清空所有会话记录 */
+  /** Clear all session records */
   clear(): void {
     this.sessions.clear();
     this.scheduleFlush();

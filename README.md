@@ -1,6 +1,6 @@
-# ChatGPT Browser Proxy
+# LLM Web Proxy
 
-Local HTTP API that exposes ChatGPT Web UI via Playwright browser automation.
+Local HTTP API that exposes LLM Web UI via Playwright browser automation.
 
 ## Setup
 

@@ -1,11 +1,12 @@
-// 会话管理器：创建/关闭会话、消息收发、并发控制、浏览器重连后会话失效处理
+// Session manager: create/close sessions, send/receive messages, concurrency control,
+// session invalidation after browser reconnection
 //
-// 每个会话对应一个独立的 ChatGPT 标签页（ChatGPTPage），由 SessionLock 串行化
-// 同一会话的并发请求（ChatGPT 页面无法处理并行输入）。
-// SessionLock 支持 drain() 终止操作：关闭会话时拒绝所有排队请求，
-// 并等待当前执行中的操作完成，确保页面关闭时无残留操作。
-// 浏览器重连时 invalidateAll() 批量失效所有会话，持久化 stale 状态后关闭页面，
-// 即使单个会话清理失败也不阻塞整体流程。
+// Each session corresponds to an independent provider tab (ProviderPage), serialized by SessionLock
+// to handle concurrent requests within the same session (LLM pages cannot handle parallel input).
+// SessionLock supports drain() for teardown: rejects all queued requests on session close,
+// and waits for the currently executing operation to finish, ensuring no stale operations on page close.
+// On browser reconnect, invalidateAll() batch-invalidates all sessions, persists stale state,
+// then closes pages; individual session cleanup failures do not block the overall flow.
 
 import { v4 as uuidv4 } from "uuid";
 import type { Config, SessionInfo } from "./types.js";
@@ -14,7 +15,7 @@ import type { ProviderPage, ProviderPageFactory, AuthExpiredDetector } from "./p
 import { ProxyError, ErrorCode } from "./errors.js";
 import { SessionStore } from "./session-store.js";
 
-/** 内部会话结构，包含 ProviderPage 实例和并发锁 */
+/** Internal session structure containing the ProviderPage instance and concurrency lock */
 interface InternalSession {
   id: string;
   accountName: string;
@@ -25,13 +26,14 @@ interface InternalSession {
   lock: SessionLock;
   closing: boolean;
   closed: boolean;
-  /** invalidateAll 清理失败时标记 */
+  /** Marked when invalidateAll cleanup fails */
   invalidated: boolean;
 }
 
 /**
- * 异步互斥锁，FIFO 排队，支持 drain() 终止操作。
- * drain() 拒绝所有排队者，等待当前持有者释放后进入终态，后续 acquire() 立即失败。
+ * Async mutex lock with FIFO queuing and drain() support.
+ * drain() rejects all queued waiters, waits for the current holder to release,
+ * then enters a terminal state where subsequent acquire() calls fail immediately.
  */
 const LOCK_TIMEOUT_MS = 120_000;
 
@@ -42,7 +44,7 @@ class SessionLock {
   private _closed = false;
   private _drainResolve: (() => void) | null = null;
 
-  /** 获取锁，超时后抛出死锁警告 */
+  /** Acquire the lock; throws a deadlock warning on timeout */
   async acquire(timeout = LOCK_TIMEOUT_MS): Promise<void> {
     if (this._closed) {
       throw new Error("Session lock closed");
@@ -74,7 +76,7 @@ class SessionLock {
     });
   }
 
-  /** 释放锁，唤醒队列中下一个等待者 */
+  /** Release the lock, waking the next waiter in the queue */
   release(): void {
     if (this._closed) {
       this.locked = false;
@@ -94,8 +96,8 @@ class SessionLock {
   }
 
   /**
-   * 终止操作：拒绝所有排队者，等待当前持有者释放。
-   * 完成后锁进入终态，后续 acquire() 均立即抛异常。
+   * Teardown: reject all queued waiters and wait for the current holder to release.
+   * After completion the lock enters a terminal state; subsequent acquire() calls throw immediately.
    */
   async drain(reason?: Error): Promise<void> {
     if (this._closed) return;
@@ -107,7 +109,7 @@ class SessionLock {
     this.queue = [];
 
     if (this.locked) {
-      // 等待当前持有者调用 release()
+      // Wait for the current holder to call release()
       return new Promise<void>((resolve) => {
         this._drainResolve = resolve;
       });
@@ -116,10 +118,10 @@ class SessionLock {
   }
 }
 
-/** 管理所有会话的生命周期：创建、消息收发、关闭、批量失效 */
+/** Manages all session lifecycles: create, message send/receive, close, batch invalidation */
 export class SessionManager {
   private sessions = new Map<string, InternalSession>();
-  /** 正在创建中的会话数，用于容量计算 */
+  /** Number of sessions currently being created, used for capacity calculation */
   private pendingCreates = 0;
   private browserManager: BrowserManager;
   private config: Config;
@@ -139,14 +141,14 @@ export class SessionManager {
     this.authExpiredDetector = authExpiredDetector;
     this.store = new SessionStore();
 
-    // 浏览器重连时所有页面句柄失效，批量标记会话为 stale
+    // On browser reconnect, all page handles become invalid; batch-mark sessions as stale
     this.browserManager.onReconnect(async () => {
       console.warn("Browser reconnected — invalidating all existing sessions");
       await this.invalidateAll();
     });
   }
 
-  /** 创建新会话：打开 ChatGPT 新对话页面 */
+  /** Create a new session: open a new LLM conversation page */
   async createSession(): Promise<SessionInfo> {
     const effectiveCount = this.sessions.size + this.pendingCreates;
     if (effectiveCount >= this.config.maxSessions) {
@@ -167,7 +169,7 @@ export class SessionManager {
         providerPage = this.pageFactory(page, this.config);
         await providerPage.navigateToNewChat();
       } catch (err: unknown) {
-        // 检测是否为认证过期并清理已创建的页面
+        // Check if auth expired and clean up the created page
         if (providerPage) {
           const url = providerPage.getPageUrl();
           await providerPage.close();
@@ -212,7 +214,7 @@ export class SessionManager {
     }
   }
 
-  /** 在指定会话中发送消息并返回 ChatGPT 回复 */
+  /** Send a message in the specified session and return the LLM reply */
   async sendMessage(sessionId: string, message: string): Promise<string> {
     const session = this.sessions.get(sessionId);
     if (!session) {
@@ -226,11 +228,11 @@ export class SessionManager {
       );
     }
 
-    // 串行化同一会话的并发请求
+    // Serialize concurrent requests within the same session
     try {
       await session.lock.acquire();
     } catch {
-      // 等待期间会话被关闭/drain
+      // Session was closed/drained while waiting
       throw new ProxyError(
         ErrorCode.SESSION_CLOSED,
         `Session "${sessionId}" is closing or already closed`
@@ -238,7 +240,7 @@ export class SessionManager {
     }
 
     try {
-      // 获取锁后再次检查 — 排队期间会话可能已关闭
+      // Re-check after acquiring lock — session may have been closed while queued
       if (session.closing || session.closed) {
         throw new ProxyError(
           ErrorCode.SESSION_CLOSED,
@@ -252,7 +254,7 @@ export class SessionManager {
       this.persistSession(session);
       return response;
     } catch (err: unknown) {
-      // 消息处理过程中会话进入关闭状态，映射为生命周期错误
+      // Session entered closing state during message processing; map to lifecycle error
       if (session.closing || session.closed) {
         if (err instanceof ProxyError) throw err;
         throw new ProxyError(
@@ -260,7 +262,7 @@ export class SessionManager {
           `Session "${sessionId}" is closing or already closed`
         );
       }
-      // 尽力检测认证过期
+      // Best-effort auth expiry detection
       const url = session.providerPage.getPageUrl();
       if (this.authExpiredDetector(url)) {
         this.browserManager.invalidateAuth();
@@ -279,12 +281,12 @@ export class SessionManager {
     }
   }
 
-  /** 获取单个会话信息（含已失效的 stale 会话） */
+  /** Get a single session's info (includes invalidated stale sessions) */
   getSession(sessionId: string): SessionInfo | null {
     const session = this.sessions.get(sessionId);
     if (session) return this.toPublicSession(session);
 
-    // 回退：从持久化存储中查找已失效的会话
+    // Fallback: look up invalidated sessions from the persistence store
     const persisted = this.store.getById(sessionId);
     if (persisted?.stale) {
       return {
@@ -299,14 +301,14 @@ export class SessionManager {
     return null;
   }
 
-  /** 列出所有会话（活跃 + stale） */
+  /** List all sessions (active + stale) */
   listSessions(): SessionInfo[] {
     const live = Array.from(this.sessions.values()).map((s) =>
       this.toPublicSession(s)
     );
     const liveIds = new Set(live.map((s) => s.id));
 
-    // 补充持久化存储中不在内存里的 stale 会话
+    // Supplement with stale sessions from persistence store that are not in memory
     const stale: SessionInfo[] = this.store
       .getAll()
       .filter((s) => s.stale && !liveIds.has(s.id))
@@ -322,17 +324,17 @@ export class SessionManager {
     return [...live, ...stale];
   }
 
-  /** 关闭指定会话：排空锁队列、关闭页面、清理存储 */
+  /** Close the specified session: drain lock queue, close page, clean up store */
   async closeSession(sessionId: string): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) {
       this.throwNotFoundOrClosed(sessionId);
     }
 
-    // 标记为正在关闭 — sendMessage 的前置检查会提前拒绝请求
+    // Mark as closing — sendMessage pre-checks will reject requests early
     session.closing = true;
 
-    // 拒绝所有排队者并等待正在执行的操作完成
+    // Reject all queued waiters and wait for the in-progress operation to complete
     await session.lock.drain(new Error(`Session "${sessionId}" closed`));
 
     if (!session.closed) {
@@ -345,16 +347,16 @@ export class SessionManager {
   }
 
   /**
-   * 浏览器重连后批量失效所有会话。
-   * 页面句柄已不可用：排空锁、关闭页面、在存储中标记为 stale。
+   * Batch-invalidate all sessions after browser reconnect.
+   * Page handles are no longer usable: drain locks, close pages, mark as stale in store.
    */
   async invalidateAll(): Promise<void> {
-    // 立即标记所有会话为 closing，阻止新的 sendMessage
+    // Immediately mark all sessions as closing to block new sendMessage calls
     for (const session of this.sessions.values()) {
       session.closing = true;
     }
 
-    // 并发排空锁和关闭页面，避免单个慢会话阻塞整体
+    // Drain locks and close pages concurrently to avoid a single slow session blocking the rest
     const entries = Array.from(this.sessions.entries());
     const results = await Promise.allSettled(
       entries.map(async ([id, session]) => {
@@ -362,7 +364,7 @@ export class SessionManager {
           new Error(`Session "${id}" invalidated — browser reconnected`)
         );
         if (!session.closed) {
-          // 先持久化 stale 状态再关闭页面 — 即使 close() 失败也能保留记录
+          // Persist stale state before closing the page — preserves records even if close() fails
           this.store.save({
             id: session.id,
             accountName: session.accountName,
@@ -378,7 +380,7 @@ export class SessionManager {
       })
     );
 
-    // 仅移除成功失效的会话；失败的保留在内存中便于诊断
+    // Only remove successfully invalidated sessions; keep failed ones in memory for diagnostics
     for (let i = 0; i < results.length; i++) {
       if (results[i].status === "fulfilled") {
         this.sessions.delete(entries[i][0]);
@@ -392,14 +394,14 @@ export class SessionManager {
     }
   }
 
-  /** 进程退出时关闭所有会话并同步刷盘 */
+  /** Close all sessions on process exit and sync-flush to disk */
   async closeAll(): Promise<void> {
     const ids = Array.from(this.sessions.keys());
     const results = await Promise.allSettled(
       ids.map((id) => this.closeSession(id))
     );
 
-    // 全部成功则清空存储，否则只删除成功关闭的
+    // Clear store if all succeeded; otherwise only remove successfully closed ones
     const allOk = results.every((r) => r.status === "fulfilled");
     if (allOk) {
       this.store.clear();
@@ -414,7 +416,7 @@ export class SessionManager {
     this.store.flushSync();
   }
 
-  /** 根据 store 中是否存在 stale 记录，抛出 SESSION_CLOSED 或 SESSION_NOT_FOUND */
+  /** Throw SESSION_CLOSED or SESSION_NOT_FOUND based on whether a stale record exists in the store */
   private throwNotFoundOrClosed(sessionId: string): never {
     const persisted = this.store.getById(sessionId);
     if (persisted?.stale) {
@@ -429,7 +431,7 @@ export class SessionManager {
     );
   }
 
-  /** 将内部会话转为公开的 SessionInfo */
+  /** Convert an internal session to the public SessionInfo view */
   private toPublicSession(session: InternalSession): SessionInfo {
     let status: SessionInfo["status"] = "active";
     if (session.invalidated) {
@@ -447,7 +449,7 @@ export class SessionManager {
     };
   }
 
-  /** 将会话元数据持久化到 SessionStore */
+  /** Persist session metadata to the SessionStore */
   private persistSession(session: InternalSession): void {
     this.store.save({
       id: session.id,

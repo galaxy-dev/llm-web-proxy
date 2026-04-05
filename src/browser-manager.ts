@@ -1,10 +1,10 @@
-// 浏览器生命周期管理：启动/关闭 Chrome、CDP 连接、登录流程、断线重连
+// Browser lifecycle management: launch/close Chrome, CDP connection, login flow, reconnection
 //
-// 使用真实 Chrome（非 Playwright 内置浏览器）+ CDP 远程调试连接，
-// 规避 ChatGPT 的自动化指纹检测。认证状态通过 --user-data-dir 持久化。
-// 启动时自动检测认证有效性，过期则启动可视化登录流程。
-// 运行中浏览器断线会自动重连，并通过 reconnectListeners 通知上层
-// （SessionManager 据此批量失效已有会话的 Page 句柄）。
+// Uses real Chrome (not Playwright's bundled browser) + CDP remote debugging,
+// to bypass LLM site automation fingerprint detection. Auth state persists via --user-data-dir.
+// Automatically checks auth validity on startup; launches visual login flow when expired.
+// Reconnects automatically on browser disconnection, notifying upper layers via reconnectListeners
+// (SessionManager uses this to batch-invalidate existing sessions' Page handles).
 
 import { chromium, type Browser, type BrowserContext } from "playwright";
 import { existsSync, mkdirSync, rmSync } from "node:fs";
@@ -13,14 +13,14 @@ import { spawn, execSync, type ChildProcess } from "node:child_process";
 import type { Config } from "./types.js";
 import type { AuthChecker } from "./providers/registry.js";
 
-/** Chrome 可执行文件的常见路径 */
+/** Common Chrome executable paths */
 const CHROME_CANDIDATES = [
   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
   "/usr/bin/google-chrome",
   "/usr/bin/google-chrome-stable",
 ];
 
-/** 管理 Chrome 浏览器实例的完整生命周期：启动、连接、认证、重连、关闭 */
+/** Manages the full lifecycle of a Chrome browser instance: launch, connect, auth, reconnect, close */
 export class BrowserManager {
   private browser: Browser | null = null;
   private chromeProcess: ChildProcess | null = null;
@@ -28,7 +28,7 @@ export class BrowserManager {
   private config: Config;
   private authChecker: AuthChecker;
   private baseUrl: string;
-  /** 浏览器重连后的回调列表，用于通知上层会话失效 */
+  /** Callbacks invoked after browser reconnection, used to notify upper layers of session invalidation */
   private reconnectListeners: Array<() => Promise<void>> = [];
   private _authenticated = false;
 
@@ -38,27 +38,27 @@ export class BrowserManager {
     this.baseUrl = baseUrl;
   }
 
-  /** 缓存的认证状态，由 ensureAuth() 和 invalidateAuth() 更新 */
+  /** Cached auth state, updated by ensureAuth() and invalidateAuth() */
   get authenticated(): boolean {
     return this._authenticated;
   }
 
-  /** 标记认证已失效，由 SessionManager 在检测到 AUTH_EXPIRED 时调用 */
+  /** Mark auth as invalid, called by SessionManager when AUTH_EXPIRED is detected */
   invalidateAuth(): void {
     this._authenticated = false;
   }
 
-  /** Chrome 用户数据目录，按账号名隔离 */
+  /** Chrome user data directory, isolated by account name */
   private get profileDir(): string {
-    return resolve(`./.chatgpt-proxy/chrome-profiles/${this.config.account.name}`);
+    return resolve(`./.llm-web-proxy/chrome-profiles/${this.config.account.name}`);
   }
 
-  /** 注册浏览器重连后的回调（如会话失效处理） */
+  /** Register a callback for browser reconnection events (e.g. session invalidation) */
   onReconnect(cb: () => Promise<void>): void {
     this.reconnectListeners.push(cb);
   }
 
-  /** 查找 Chrome 可执行文件路径，优先使用 CHROME_PATH 环境变量 */
+  /** Find the Chrome executable path, preferring the CHROME_PATH env variable */
   private findChrome(): string {
     const envPath = process.env.CHROME_PATH;
     if (envPath) {
@@ -74,11 +74,11 @@ export class BrowserManager {
   }
 
   /**
-   * 启动真实 Chrome 并通过 CDP 连接。
-   * 使用真实浏览器而非 Playwright 内置浏览器，避免自动化指纹检测。
+   * Launch real Chrome and connect via CDP.
+   * Uses real browser instead of Playwright's bundled one to avoid automation fingerprint detection.
    */
   private async launchChrome(headless: boolean): Promise<Browser> {
-    // 清理上次崩溃可能残留的 Chrome 进程
+    // Clean up Chrome processes that may have survived a previous crash
     this.killChrome();
     this.killChromeOnPort();
 
@@ -86,7 +86,7 @@ export class BrowserManager {
     const profileDir = this.profileDir;
     if (!existsSync(profileDir)) mkdirSync(profileDir, { recursive: true });
 
-    // 清除残留的 profile 锁文件
+    // Remove stale profile lock files
     const lockFile = resolve(profileDir, "SingletonLock");
     if (existsSync(lockFile)) rmSync(lockFile, { force: true });
 
@@ -108,7 +108,7 @@ export class BrowserManager {
 
     const wsUrl = await this.waitForCDP();
 
-    // CDP 连接最多重试 3 次
+    // Retry CDP connection up to 3 times
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
         return await chromium.connectOverCDP(wsUrl);
@@ -121,7 +121,7 @@ export class BrowserManager {
     throw new Error("unreachable");
   }
 
-  /** 轮询等待 Chrome CDP 端口就绪，返回 WebSocket 调试地址 */
+  /** Poll until Chrome CDP port is ready, returns the WebSocket debugger URL */
   private async waitForCDP(timeout = 10_000): Promise<string> {
     const deadline = Date.now() + timeout;
     while (Date.now() < deadline) {
@@ -132,27 +132,27 @@ export class BrowserManager {
           return json.webSocketDebuggerUrl;
         }
       } catch {
-        // CDP 尚未就绪
+        // CDP not ready yet
       }
       await new Promise((r) => setTimeout(r, 200));
     }
     throw new Error(`Chrome CDP not ready after ${timeout}ms`);
   }
 
-  /** 启动 Chrome 并初始化浏览器上下文 */
+  /** Launch Chrome and initialize the browser context */
   async launch(): Promise<void> {
     this.browser = await this.launchChrome(this.config.headless);
     await this.initContext();
     console.log(`Chrome launched via CDP (headless: ${this.config.headless})`);
   }
 
-  /** 检查当前浏览器会话是否已通过认证（委托给 provider 的 authChecker） */
+  /** Check if the current browser session is authenticated (delegates to provider's authChecker) */
   async checkAuth(): Promise<boolean> {
     if (!this.context) return false;
     return this.authChecker(this.context, this.config);
   }
 
-  /** 确保认证有效，过期时自动启动交互式登录流程 */
+  /** Ensure auth is valid; automatically launches interactive login flow when expired */
   async ensureAuth(): Promise<void> {
     if (await this.checkAuth()) {
       this._authenticated = true;
@@ -167,7 +167,7 @@ export class BrowserManager {
     this._authenticated = true;
   }
 
-  /** 获取共享的浏览器上下文（连接断开时自动重连） */
+  /** Get the shared browser context (auto-reconnects on disconnect) */
   async getContext(): Promise<BrowserContext> {
     if (this.context) {
       try {
@@ -183,7 +183,7 @@ export class BrowserManager {
     throw new Error("Browser not launched or context not initialized");
   }
 
-  /** 初始化浏览器上下文：获取默认上下文并清理 Chrome 自带的空白标签页 */
+  /** Initialize browser context: get default context and close Chrome's built-in blank tabs */
   private async initContext(): Promise<void> {
     if (!this.browser) throw new Error("Browser not launched");
 
@@ -192,7 +192,7 @@ export class BrowserManager {
       throw new Error("No browser context available from CDP connection");
     }
 
-    // 关闭 Chrome 启动时自动打开的空白页
+    // Close blank pages that Chrome opens automatically on startup
     for (const p of context.pages()) {
       const url = p.url();
       if (url === "about:blank" || url.startsWith("chrome://newtab")) {
@@ -205,15 +205,15 @@ export class BrowserManager {
   }
 
   /**
-   * 打开可视 Chrome 窗口进行手动登录。
-   * 认证状态通过 Chrome --user-data-dir 持久化，跨重启保留。
+   * Open a visible Chrome window for manual login.
+   * Auth state persists via Chrome --user-data-dir, surviving restarts.
    */
   async loginFlow(): Promise<void> {
     const account = this.config.account;
 
     const browser = await this.launchChrome(false);
     const context = browser.contexts()[0];
-    // 仅关闭 Chrome 初始的空白/chrome 标签页
+    // Only close Chrome's initial blank/chrome tabs
     for (const p of context.pages()) {
       const url = p.url();
       if (url === "about:blank" || url.startsWith("chrome://newtab")) {
@@ -230,13 +230,13 @@ export class BrowserManager {
       timeout: this.config.timeouts.navigation,
     });
 
-    // 等待用户手动登录后按回车
+    // Wait for the user to finish manual login and press Enter
     await new Promise<void>((resolve) => {
       process.stdin.resume();
       process.stdin.once("data", () => resolve());
     });
 
-    // 保存存储状态作为备份快照
+    // Save storage state as a backup snapshot
     const storagePath = resolve(account.storageStatePath);
     const dir = dirname(storagePath);
     if (!existsSync(dir)) {
@@ -250,7 +250,7 @@ export class BrowserManager {
     this.killChrome();
   }
 
-  /** 浏览器断线重连：重启 Chrome 并通知所有监听者 */
+  /** Reconnect after browser disconnection: restart Chrome and notify all listeners */
   private async reconnect(): Promise<void> {
     if (this.browser) {
       await this.browser.close().catch(() => {});
@@ -262,7 +262,7 @@ export class BrowserManager {
     await this.initContext();
     console.log("Chrome reconnected");
 
-    // 通知监听者 — 旧的页面句柄已失效
+    // Notify listeners — old page handles are now invalid
     for (const listener of this.reconnectListeners) {
       await listener().catch((err: unknown) => {
         console.error("onReconnect listener failed:", err);
@@ -270,20 +270,20 @@ export class BrowserManager {
     }
   }
 
-  /** 关闭浏览器和 Chrome 进程 */
+  /** Close the browser and Chrome process */
   async close(): Promise<void> {
-    // 默认上下文是浏览器级共享资源，不能单独关闭
+    // Default context is a browser-level shared resource, cannot be closed individually
     this.context = null;
     if (this.browser) {
       await this.browser.close().catch(() => {});
       this.browser = null;
     }
-    // 优雅等待 Chrome 退出，超时后强制终止
+    // Gracefully wait for Chrome to exit, force-kill on timeout
     await this.stopChrome();
     console.log("Browser closed");
   }
 
-  /** 优雅关闭 Chrome：先等待自然退出，超时后 SIGKILL 强制终止 */
+  /** Gracefully close Chrome: wait for natural exit first, SIGKILL on timeout */
   private async stopChrome(timeout = 5000): Promise<void> {
     if (!this.chromeProcess) return;
     const proc = this.chromeProcess;
@@ -303,7 +303,7 @@ export class BrowserManager {
     });
   }
 
-  /** 终止已跟踪的 Chrome 子进程 */
+  /** Kill the tracked Chrome child process */
   private killChrome(): void {
     if (this.chromeProcess) {
       this.chromeProcess.kill();
@@ -311,9 +311,9 @@ export class BrowserManager {
     }
   }
 
-  /** 终止占用本实例 CDP 端口且使用相同 profile 的残留 Chrome 进程 */
+  /** Kill stale Chrome processes occupying this instance's CDP port with the same profile */
   private killChromeOnPort(): void {
-    // 精确匹配 CDP 端口 + profile 目录，避免误杀用户自己的 Chrome
+    // Match CDP port + profile dir precisely to avoid killing the user's own Chrome
     const profileDir = this.profileDir;
     try {
       const output = execSync(
@@ -333,11 +333,11 @@ export class BrowserManager {
             process.kill(pid, "SIGTERM");
           }
         } catch {
-          // 进程已退出
+          // Process already exited
         }
       }
     } catch {
-      // pgrep 不可用或无匹配 — 正常
+      // pgrep unavailable or no matches — normal
     }
   }
 }

@@ -1,11 +1,11 @@
 {
   "port": 3210,
   "headless": true,
-  "chatgptUrl": "https://chatgpt.com",
+  "providerUrl": "https://chatgpt.com",
   "maxSessions": 20,
   "account": {
     "name": "default",
-    "storageStatePath": "./.chatgpt-proxy/accounts/default.json"
+    "storageStatePath": "./.llm-web-proxy/accounts/default.json"
   },
   "timeouts": {
     "navigation": 30000,
