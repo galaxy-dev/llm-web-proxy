@@ -11,8 +11,8 @@
 // Session isolation and keepalive:
 //   Each MCP connection maintains its own ownedSessions set, only operating on sessions it created.
 //   SSE connections send :ping heartbeats every 30s to prevent idle timeout disconnects.
-//   On SSE disconnect, sessions are not deleted immediately but placed in an orphan pool for 60s;
-//   new connections can auto-adopt orphaned sessions by using the session ID; unclaimed ones are deleted.
+//   On SSE disconnect, sessions are not deleted immediately but placed in an orphan pool;
+//   new connections can adopt orphaned sessions by referencing the session ID; unclaimed ones are deleted.
 
 import { createServer } from "node:http";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -24,7 +24,7 @@ const PROXY_URL = process.env.LLM_WEB_PROXY_URL ?? "http://localhost:3210";
 
 /** Populated by main() after config is loaded */
 let SSE_KEEPALIVE_INTERVAL_MS = 30_000;
-let ORPHAN_GRACE_PERIOD_MS = 60_000;
+let ORPHAN_GRACE_PERIOD_MS = 14_400_000;
 /** Enabled provider names, populated at startup */
 let ENABLED_PROVIDERS: string[] = [];
 
@@ -42,7 +42,6 @@ function orphanSession(sessionId: string, clientId: string): void {
     console.error(`Orphaned session ${sessionId} expired — deleted`);
   }, ORPHAN_GRACE_PERIOD_MS);
 
-  timer.unref();
   orphanPool.set(sessionId, { timer, fromClient: clientId });
   console.error(`Session ${sessionId} orphaned by ${clientId} (grace: ${ORPHAN_GRACE_PERIOD_MS}ms)`);
 }
@@ -235,12 +234,6 @@ function registerTools(server: McpServer, ownedSessions: Set<string>, clientId: 
         "Failed"
       );
       if ("error" in result) return result.error;
-      // Auto-adopt any orphaned sessions into this connection
-      for (const s of result.data) {
-        if (!ownedSessions.has(s.id)) {
-          tryAdoptOrphan(s.id, ownedSessions, clientId);
-        }
-      }
       const owned = result.data.filter((s) => ownedSessions.has(s.id));
       return mcpText(JSON.stringify(owned, null, 2));
     }
@@ -274,7 +267,8 @@ function registerTools(server: McpServer, ownedSessions: Set<string>, clientId: 
         return mcpError(`Session ${sessionId} not owned by this connection`);
       }
       const res = await api(`/sessions/${sessionId}`, { method: "DELETE" });
-      if (!res.ok) {
+      // Treat 404/410 as successful close (session already gone or closed)
+      if (!res.ok && res.status !== 404 && res.status !== 410) {
         const result = await parseOrError<never>(res, "Failed");
         if ("error" in result) return result.error;
       }
@@ -306,7 +300,11 @@ async function main() {
     .filter(([, p]) => p.enabled)
     .map(([name]) => name);
 
-  const port = parseInt(process.env.MCP_PORT ?? "3211");
+  const rawPort = process.env.MCP_PORT ?? "3211";
+  const port = parseInt(rawPort, 10);
+  if (isNaN(port) || port < 1 || port > 65535) {
+    throw new Error(`Invalid MCP_PORT: ${rawPort}`);
+  }
   const transports = new Map<string, SSEServerTransport>();
   let clientSeq = 0;
 
@@ -383,8 +381,8 @@ async function main() {
     res.end();
   });
 
-  httpServer.listen(port, "0.0.0.0", () => {
-    console.error(`MCP server (SSE) listening on http://0.0.0.0:${port}/sse`);
+  httpServer.listen(port, "127.0.0.1", () => {
+    console.error(`MCP server (SSE) listening on http://127.0.0.1:${port}/sse`);
   });
 }
 

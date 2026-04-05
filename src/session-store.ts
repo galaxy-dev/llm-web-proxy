@@ -59,7 +59,11 @@ export class SessionStore {
       if (this.sessions.size > 0) {
         this.scheduleFlush();
       }
-    } catch {
+    } catch (err: unknown) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "EACCES" || code === "EPERM") {
+        throw new Error(`Cannot read session store: ${(err as Error).message}`);
+      }
       console.warn("Failed to load session store, starting fresh");
     }
   }
@@ -101,7 +105,7 @@ export class SessionStore {
 
   /**
    * Sync disk write — used only during process shutdown to ensure data is persisted before exit.
-   * Writes unconditionally, overriding any in-progress async flush.
+   * Uses a distinct tmp path (.sync.tmp) to avoid racing with an in-flight flushAsync (.tmp).
    */
   flushSync(): void {
     if (this.flushTimer) {
@@ -114,7 +118,7 @@ export class SessionStore {
     if (!existsSync(dir)) {
       mkdirSync(dir, { recursive: true });
     }
-    const tmpPath = STORE_PATH + ".tmp";
+    const tmpPath = STORE_PATH + ".sync.tmp";
     writeFileSync(tmpPath, this.toSerializable());
     renameSync(tmpPath, STORE_PATH);
   }

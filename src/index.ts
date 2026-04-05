@@ -8,24 +8,23 @@
 //    Sessions are only closed on explicit DELETE or process exit. No scheduled cleanup in v1.
 //    Rationale: current use case is AI cross-review workflows; session lifecycle is caller-managed.
 //
-//
-// 3. Reconnect listener failures are logged only
+// 2. Reconnect listener failures are logged only
 //    Listener failures after browser reconnection do not block recovery or trigger rollback.
 //    Rationale: making recovery transactional is too costly; logging is sufficient for debugging.
 //
-// 4. No API access control / token verification
-//    Server binds to 127.0.0.1 with no Authorization header checks.
+// 3. No API access control / token verification
+//    HTTP and MCP servers both bind to 127.0.0.1 with no Authorization header checks.
 //    Rationale: local access only, not exposed to the network.
 //
-// 5. Single-account architecture
+// 4. Single-account architecture
 //    Config uses a single account object; no multi-account pooling/scheduling/health tracking.
 //    Rationale: multi-account is explicitly out of v1 scope, see memory/project_multi_account_rationale.md.
 //
-// 6. Inconsistent time field naming
+// 5. Inconsistent time field naming
 //    createdAt / lastActivity / savedAt mix "At" suffix and no-suffix styles.
 //    Rationale: no functional impact; pure style issue, not worth a full-rename churn.
 //
-// 7. Broad "closing" state semantics
+// 6. Broad "closing" state semantics
 //    SessionStatus "closing" covers both user-initiated close and reconnect invalidation
 //    in the initial phase, without distinct sub-states.
 //    Rationale: closing window is very short; splitting into sub-states offers little API benefit.

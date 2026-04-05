@@ -1,46 +1,17 @@
 // Claude page interaction layer: encapsulates input, send, wait for reply, and extract reply text DOM operations
 //
-// Adapts to Claude.ai's DOM structure via candidate selector lists.
-// resolveSelector() probes candidates by priority and caches the match; retries on invalidation.
+// Extends BaseProviderPage for shared DOM patterns (selector resolution, response streaming, etc).
 // Long text (>2000 chars) is sent via clipboard paste with a global mutex to prevent concurrent overwrites.
-// Reply detection has two phases: streaming indicator disappears -> text stability check.
-// Timeout scenarios carry partialResponse to avoid total loss after long waits.
+// Claude-specific: very long pastes create a "PASTED" attachment card; detected via send button state.
 
 import type { Page } from "playwright";
 import type { Config } from "../../types.js";
 import { ProxyError, ErrorCode } from "../../errors.js";
-import type { ProviderPage, ProviderPageOptions } from "../registry.js";
+import type { ProviderPageOptions } from "../registry.js";
+import { BaseProviderPage } from "../base-page.js";
+import { acquireClipboard, releaseClipboard } from "../../clipboard-mutex.js";
 
-/**
- * Global clipboard mutex.
- * Prevents concurrent long-text pastes from overwriting each other's clipboard content.
- */
-let clipboardLocked = false;
-const clipboardQueue: Array<() => void> = [];
-
-async function acquireClipboard(): Promise<void> {
-  if (!clipboardLocked) {
-    clipboardLocked = true;
-    return;
-  }
-  return new Promise<void>((resolve) => {
-    clipboardQueue.push(resolve);
-  });
-}
-
-function releaseClipboard(): void {
-  const next = clipboardQueue.shift();
-  if (next) {
-    next();
-  } else {
-    clipboardLocked = false;
-  }
-}
-
-/**
- * Candidate selector lists for interactive elements.
- * resolveSelector() probes visibility in order and caches the result.
- */
+/** Candidate selector lists for Claude interactive elements */
 const SELECTOR_CANDIDATES = {
   messageInput: [
     "div.ProseMirror[contenteditable='true']",
@@ -59,10 +30,7 @@ const SELECTOR_CANDIDATES = {
   ],
 };
 
-/**
- * Assistant message selectors — targets the response content containers.
- * Queries the current DOM each time; not cached.
- */
+/** Assistant message selectors for Claude */
 const ASSISTANT_MESSAGE_SELECTORS = [
   "[data-is-streaming]",
   'div[data-testid="assistant-message"]',
@@ -70,84 +38,12 @@ const ASSISTANT_MESSAGE_SELECTORS = [
 ];
 
 /** Encapsulates interaction with a single Claude.ai page tab */
-export class ClaudePage implements ProviderPage {
-  private page: Page;
-  private config: Config;
-  private providerUrl: string;
-  private ephemeral: boolean;
-  /** Resolved selector cache to avoid repeated probing */
-  private resolved: Record<string, string> = {};
+export class ClaudePage extends BaseProviderPage {
+  protected readonly SELECTOR_CANDIDATES = SELECTOR_CANDIDATES;
+  protected readonly ASSISTANT_MESSAGE_SELECTORS = ASSISTANT_MESSAGE_SELECTORS;
 
   constructor(page: Page, config: Config, options: ProviderPageOptions) {
-    this.page = page;
-    this.config = config;
-    this.providerUrl = options.providerUrl;
-    this.ephemeral = options.ephemeral;
-  }
-
-  /**
-   * Resolve a visible interactive element selector from the candidate list and cache it.
-   * Throws PAGE_STRUCTURE_CHANGED when none of the candidates are visible.
-   */
-  private async resolveSelector(
-    key: keyof typeof SELECTOR_CANDIDATES,
-    timeout = 3000,
-  ): Promise<string> {
-    if (this.resolved[key]) {
-      const visible = await this.page
-        .locator(this.resolved[key])
-        .first()
-        .isVisible()
-        .catch(() => false);
-      if (visible) return this.resolved[key];
-      delete this.resolved[key];
-    }
-
-    const candidates = SELECTOR_CANDIDATES[key];
-
-    for (const sel of candidates) {
-      const visible = await this.page
-        .locator(sel)
-        .first()
-        .isVisible()
-        .catch(() => false);
-      if (visible) {
-        this.resolved[key] = sel;
-        return sel;
-      }
-    }
-
-    const combined = candidates.join(", ");
-    await this.page.waitForSelector(combined, {
-      state: "visible",
-      timeout,
-    });
-
-    for (const sel of candidates) {
-      const visible = await this.page
-        .locator(sel)
-        .first()
-        .isVisible()
-        .catch(() => false);
-      if (visible) {
-        this.resolved[key] = sel;
-        return sel;
-      }
-    }
-
-    throw new ProxyError(
-      ErrorCode.PAGE_STRUCTURE_CHANGED,
-      `Unable to resolve visible selector for "${key}"`,
-    );
-  }
-
-  /** Get a combined locator for all assistant messages (queries DOM each time, not cached) */
-  private assistantMessages() {
-    return this.page.locator(ASSISTANT_MESSAGE_SELECTORS.join(", "));
-  }
-
-  private stopButtonCombinedSelector(): string {
-    return SELECTOR_CANDIDATES.stopButton.join(", ");
+    super(page, config, options);
   }
 
   /** Navigate to a new conversation page */
@@ -188,14 +84,22 @@ export class ClaudePage implements ProviderPage {
         releaseClipboard();
       }
 
-      // Verify text was pasted into the composer
-      await this.page.waitForTimeout(500);
+      // After pasting long text, Claude may convert it to a "PASTED" attachment card.
+      // When that happens the composer text is empty but the send button is active.
+      // Unlike ChatGPT, Claude doesn't need a separate prompt — the PASTED card IS the content.
+      // Verify paste succeeded by checking: composer has text OR send button became enabled.
+      await this.page.waitForTimeout(2000);
+
       const composerText = await input.innerText().catch(() => "");
       if (composerText.trim().length === 0) {
-        throw new ProxyError(
-          ErrorCode.PAGE_STRUCTURE_CHANGED,
-          "Long text paste failed: no composer content detected",
-        );
+        // Composer empty — wait for send button to become active (indicates attachment was created)
+        const pasteOk = await this.waitForSendButtonActive(8_000);
+        if (!pasteOk) {
+          throw new ProxyError(
+            ErrorCode.PAGE_STRUCTURE_CHANGED,
+            "Long text paste failed: no attachment or composer content detected",
+          );
+        }
       }
     } else {
       await input.pressSequentially(text, { delay: 5 });
@@ -223,115 +127,21 @@ export class ClaudePage implements ProviderPage {
     return this.getLastAssistantMessage();
   }
 
-  /** Wait for Claude streaming response to complete: stop button disappears, then text stability check */
-  private async waitForResponseComplete(): Promise<void> {
-    const { response: responseTimeout, stability: stabilityMs } =
-      this.config.timeouts;
-    const deadline = Date.now() + responseTimeout;
-    const checkInterval = 500;
-    const stopSel = this.stopButtonCombinedSelector();
-
-    // Phase 1: wait for the streaming indicator (stop button) to appear then disappear
-    const alreadyVisible = await this.page
-      .locator(stopSel)
-      .first()
-      .isVisible()
-      .catch(() => false);
-
-    if (!alreadyVisible) {
-      try {
-        await this.page.waitForSelector(stopSel, {
-          state: "visible",
-          timeout: 3000,
-        });
-      } catch {
-        // Never appeared — reply may already be complete
-      }
-    }
-
-    let stopButtonCleared = false;
-    try {
-      const remaining = Math.max(0, deadline - Date.now());
-      await this.page.waitForSelector(stopSel, {
-        state: "hidden",
-        timeout: remaining,
-      });
-      stopButtonCleared = true;
-    } catch {
-      // Timed out — continue to stability check
-    }
-
-    // Phase 2: text stability check
-    const effectiveStability = stopButtonCleared ? checkInterval : stabilityMs;
-    let lastText = "";
-    let stableTime = 0;
-
+  /** Wait for the send button to become active (not disabled); used to verify paste/attachment success */
+  private async waitForSendButtonActive(timeout: number): Promise<boolean> {
+    const deadline = Date.now() + timeout;
     while (Date.now() < deadline) {
-      const currentText = await this.getLastAssistantMessage();
-
-      if (currentText === lastText && currentText.length > 0) {
-        stableTime += checkInterval;
-        if (stableTime >= effectiveStability) return;
-      } else {
-        stableTime = 0;
-        lastText = currentText;
-      }
-
-      await this.page.waitForTimeout(checkInterval);
-    }
-
-    const partialText = await this.getLastAssistantMessage();
-    throw new ProxyError(
-      ErrorCode.RESPONSE_TIMEOUT,
-      "Timed out waiting for Claude response",
-      partialText || undefined,
-    );
-  }
-
-  /** Extract the text of the last assistant message */
-  private async getLastAssistantMessage(): Promise<string> {
-    const messages = this.assistantMessages();
-    const count = await messages.count();
-    if (count === 0) return "";
-
-    const last = messages.nth(count - 1);
-    return (await last.innerText()).trim();
-  }
-
-  /** Wait for the send button to become clickable and submit; falls back to Enter key on timeout */
-  private async waitUntilSendReadyAndSubmit(): Promise<void> {
-    const deadline = Date.now() + this.config.timeouts.navigation;
-
-    while (Date.now() < deadline) {
-      for (const sel of SELECTOR_CANDIDATES.sendButton) {
+      for (const sel of this.SELECTOR_CANDIDATES.sendButton) {
         const btn = this.page.locator(sel).first();
         const visible = await btn.isVisible().catch(() => false);
         if (!visible) continue;
-
         const disabled = await btn
           .evaluate((el) => (el as HTMLButtonElement).disabled)
           .catch(() => true);
-        if (!disabled) {
-          await btn.click();
-          return;
-        }
+        if (!disabled) return true;
       }
-      await this.page.waitForTimeout(200);
+      await this.page.waitForTimeout(500);
     }
-
-    // Fallback: use Enter key
-    const input = this.page.locator(
-      await this.resolveSelector("messageInput"),
-    );
-    await input.click();
-    await this.page.keyboard.press("Enter");
-  }
-
-  getPageUrl(): string {
-    return this.page.url();
-  }
-
-  async close(): Promise<void> {
-    await this.page.close().catch(() => {});
+    return false;
   }
 }

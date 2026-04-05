@@ -1,47 +1,17 @@
 // ChatGPT page interaction layer: encapsulates input, send, wait for reply, and extract reply text DOM operations
 //
-// Adapts to ChatGPT's frequently changing DOM structure via candidate selector lists.
-// resolveSelector() probes candidates by priority and caches the match; retries on invalidation.
+// Extends BaseProviderPage for shared DOM patterns (selector resolution, response streaming, etc).
 // Long text (>2000 chars) is sent via clipboard paste with a global mutex to prevent concurrent overwrites.
-// Reply detection has two phases: stop button disappears -> text stability check,
-// balancing fast replies and streaming output.
-// Timeout scenarios carry partialResponse to avoid total loss after long waits.
+// ChatGPT-specific: long pastes may generate a file attachment; handled via waitForAttachment.
 
 import type { Page, Locator } from "playwright";
 import type { Config } from "../../types.js";
 import { ProxyError, ErrorCode } from "../../errors.js";
-import type { ProviderPage, ProviderPageOptions } from "../registry.js";
+import type { ProviderPageOptions } from "../registry.js";
+import { BaseProviderPage } from "../base-page.js";
+import { acquireClipboard, releaseClipboard } from "../../clipboard-mutex.js";
 
-/**
- * Global clipboard mutex.
- * Prevents concurrent long-text pastes from overwriting each other's clipboard content.
- */
-let clipboardLocked = false;
-const clipboardQueue: Array<() => void> = [];
-
-async function acquireClipboard(): Promise<void> {
-  if (!clipboardLocked) {
-    clipboardLocked = true;
-    return;
-  }
-  return new Promise<void>((resolve) => {
-    clipboardQueue.push(resolve);
-  });
-}
-
-function releaseClipboard(): void {
-  const next = clipboardQueue.shift();
-  if (next) {
-    next();
-  } else {
-    clipboardLocked = false;
-  }
-}
-
-/**
- * Candidate selector lists for interactive elements.
- * resolveSelector() probes visibility in order and caches the result.
- */
+/** Candidate selector lists for ChatGPT interactive elements */
 const SELECTOR_CANDIDATES = {
   messageInput: [
     "#prompt-textarea",
@@ -63,10 +33,7 @@ const SELECTOR_CANDIDATES = {
   ],
 };
 
-/**
- * Assistant message selectors — observation targets that may not exist in a new conversation.
- * Queries the current DOM each time; not cached.
- */
+/** Assistant message selectors for ChatGPT */
 const ASSISTANT_MESSAGE_SELECTORS = [
   '[data-message-author-role="assistant"]',
   '[data-role="assistant"]',
@@ -74,87 +41,12 @@ const ASSISTANT_MESSAGE_SELECTORS = [
 ];
 
 /** Encapsulates interaction with a single ChatGPT page tab */
-export class ChatGPTPage implements ProviderPage {
-  private page: Page;
-  private config: Config;
-  private providerUrl: string;
-  private ephemeral: boolean;
-  /** Resolved selector cache to avoid repeated probing */
-  private resolved: Record<string, string> = {};
+export class ChatGPTPage extends BaseProviderPage {
+  protected readonly SELECTOR_CANDIDATES = SELECTOR_CANDIDATES;
+  protected readonly ASSISTANT_MESSAGE_SELECTORS = ASSISTANT_MESSAGE_SELECTORS;
 
   constructor(page: Page, config: Config, options: ProviderPageOptions) {
-    this.page = page;
-    this.config = config;
-    this.providerUrl = options.providerUrl;
-    this.ephemeral = options.ephemeral;
-  }
-
-  /**
-   * Resolve a visible interactive element selector from the candidate list and cache it.
-   * Throws PAGE_STRUCTURE_CHANGED when none of the candidates are visible.
-   */
-  private async resolveSelector(
-    key: keyof typeof SELECTOR_CANDIDATES,
-    timeout = 3000
-  ): Promise<string> {
-    // Check if the cached selector is still visible
-    if (this.resolved[key]) {
-      const visible = await this.page
-        .locator(this.resolved[key])
-        .first()
-        .isVisible()
-        .catch(() => false);
-      if (visible) return this.resolved[key];
-      delete this.resolved[key];
-    }
-
-    const candidates = SELECTOR_CANDIDATES[key];
-
-    // Quick check: iterate all candidates
-    for (const sel of candidates) {
-      const visible = await this.page
-        .locator(sel)
-        .first()
-        .isVisible()
-        .catch(() => false);
-      if (visible) {
-        this.resolved[key] = sel;
-        return sel;
-      }
-    }
-
-    // Wait for any candidate to become visible
-    const combined = candidates.join(", ");
-    await this.page.waitForSelector(combined, {
-      state: "visible",
-      timeout,
-    });
-
-    for (const sel of candidates) {
-      const visible = await this.page
-        .locator(sel)
-        .first()
-        .isVisible()
-        .catch(() => false);
-      if (visible) {
-        this.resolved[key] = sel;
-        return sel;
-      }
-    }
-
-    throw new ProxyError(
-      ErrorCode.PAGE_STRUCTURE_CHANGED,
-      `Unable to resolve visible selector for "${key}"`
-    );
-  }
-
-  /** Get a combined locator for all assistant messages (queries DOM each time, not cached) */
-  private assistantMessages() {
-    return this.page.locator(ASSISTANT_MESSAGE_SELECTORS.join(", "));
-  }
-
-  private stopButtonCombinedSelector(): string {
-    return SELECTOR_CANDIDATES.stopButton.join(", ");
+    super(page, config, options);
   }
 
   /** Read composer text, compatible with both textarea and contenteditable implementations */
@@ -262,86 +154,6 @@ export class ChatGPTPage implements ProviderPage {
     return this.getLastAssistantMessage();
   }
 
-  /** Wait for ChatGPT streaming response to complete: stop button disappears, then text stability check */
-  private async waitForResponseComplete(): Promise<void> {
-    const { response: responseTimeout, stability: stabilityMs } =
-      this.config.timeouts;
-    const deadline = Date.now() + responseTimeout;
-    const checkInterval = 500;
-    const stopSel = this.stopButtonCombinedSelector();
-
-    // Phase 1: wait for the streaming indicator (stop button) to appear then disappear
-    const alreadyVisible = await this.page
-      .locator(stopSel)
-      .first()
-      .isVisible()
-      .catch(() => false);
-
-    if (!alreadyVisible) {
-      // Not yet visible — wait briefly (fast replies may skip this phase)
-      try {
-        await this.page.waitForSelector(stopSel, {
-          state: "visible",
-          timeout: 3000,
-        });
-      } catch {
-        // Never appeared — reply may already be complete
-      }
-    }
-
-    // Wait for the stop button to disappear (streaming output finished)
-    let stopButtonCleared = false;
-    try {
-      const remaining = Math.max(0, deadline - Date.now());
-      await this.page.waitForSelector(stopSel, {
-        state: "hidden",
-        timeout: remaining,
-      });
-      stopButtonCleared = true;
-    } catch {
-      // Timed out — continue to stability check
-    }
-
-    // Phase 2: text stability check — confirm reply text has stopped changing
-    // After normal stop button clearance, only a quick confirmation is needed;
-    // on timeout, use the full stability window
-    const effectiveStability = stopButtonCleared ? checkInterval : stabilityMs;
-    let lastText = "";
-    let stableTime = 0;
-
-    while (Date.now() < deadline) {
-      const currentText = await this.getLastAssistantMessage();
-
-      if (currentText === lastText && currentText.length > 0) {
-        stableTime += checkInterval;
-        if (stableTime >= effectiveStability) return;
-      } else {
-        stableTime = 0;
-        lastText = currentText;
-      }
-
-      await this.page.waitForTimeout(checkInterval);
-    }
-
-    // Timed out — must return RESPONSE_TIMEOUT, not 200
-    const partialText = await this.getLastAssistantMessage();
-    throw new ProxyError(
-      ErrorCode.RESPONSE_TIMEOUT,
-      "Timed out waiting for ChatGPT response",
-      partialText || undefined
-    );
-  }
-
-  /** Extract the text of the last assistant message */
-  private async getLastAssistantMessage(): Promise<string> {
-    const messages = this.assistantMessages();
-    const count = await messages.count();
-    if (count === 0) return "";
-
-    const last = messages.nth(count - 1);
-    return (await last.innerText()).trim();
-  }
-
   /** Wait for attachment element to appear after long text paste; returns whether it succeeded */
   private async waitForAttachment(timeout: number): Promise<boolean> {
     const sel = 'button[aria-label^="Remove file"]';
@@ -351,43 +163,5 @@ export class ChatGPTPage implements ProviderPage {
     } catch {
       return false;
     }
-  }
-
-  /** Wait for the send button to become clickable and submit; falls back to Enter key on timeout */
-  private async waitUntilSendReadyAndSubmit(): Promise<void> {
-    const deadline = Date.now() + this.config.timeouts.navigation;
-
-    while (Date.now() < deadline) {
-      for (const sel of SELECTOR_CANDIDATES.sendButton) {
-        const btn = this.page.locator(sel).first();
-        const visible = await btn.isVisible().catch(() => false);
-        if (!visible) continue;
-
-        const disabled = await btn
-          .evaluate((el) => (el as HTMLButtonElement).disabled)
-          .catch(() => true);
-        if (!disabled) {
-          await btn.click();
-          return;
-        }
-      }
-      await this.page.waitForTimeout(200);
-    }
-
-    // Fallback: use Enter key when no usable button is found
-    const input = this.page.locator(
-      await this.resolveSelector("messageInput")
-    );
-    await input.click();
-    await this.page.keyboard.press("Enter");
-  }
-
-  getPageUrl(): string {
-    return this.page.url();
-  }
-
-  /** Close the page tab */
-  async close(): Promise<void> {
-    await this.page.close().catch(() => {});
   }
 }

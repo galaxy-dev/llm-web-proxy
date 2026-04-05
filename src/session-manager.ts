@@ -294,6 +294,9 @@ export class SessionManager {
         );
       }
       if (err instanceof ProxyError) throw err;
+      if (err instanceof Error && err.name === "TimeoutError") {
+        throw new ProxyError(ErrorCode.RESPONSE_TIMEOUT, err.message);
+      }
       throw new ProxyError(
         ErrorCode.BROWSER_ERROR,
         err instanceof Error ? err.message : String(err)
@@ -461,6 +464,8 @@ export class SessionManager {
     let status: SessionInfo["status"] = "active";
     if (session.invalidated) {
       status = "error";
+    } else if (session.closed) {
+      status = "stale";
     } else if (session.closing) {
       status = "closing";
     }

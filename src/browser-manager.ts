@@ -10,7 +10,7 @@
 import { chromium, type Browser, type BrowserContext } from "playwright";
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { resolve, dirname } from "node:path";
-import { spawn, execSync, type ChildProcess } from "node:child_process";
+import { spawn, execFileSync, type ChildProcess } from "node:child_process";
 import type { Config } from "./types.js";
 import type { AuthChecker } from "./providers/registry.js";
 
@@ -29,6 +29,8 @@ export class BrowserManager {
   private config: Config;
   /** Callbacks invoked after browser reconnection, used to notify upper layers of session invalidation */
   private reconnectListeners: Array<() => Promise<void>> = [];
+  /** Deduplicates concurrent reconnect() calls — second caller awaits the same promise */
+  private reconnectPromise: Promise<void> | null = null;
   /** Per-provider authentication status */
   private authStatuses = new Map<string, boolean>();
 
@@ -137,6 +139,10 @@ export class BrowserManager {
   private async waitForCDP(timeout = 10_000): Promise<string> {
     const deadline = Date.now() + timeout;
     while (Date.now() < deadline) {
+      // Fail fast if Chrome already exited
+      if (this.chromeProcess?.exitCode != null) {
+        throw new Error(`Chrome exited prematurely with code ${this.chromeProcess.exitCode}`);
+      }
       try {
         const res = await fetch(`http://127.0.0.1:${this.config.cdpPort}/json/version`);
         if (res.ok) {
@@ -247,12 +253,28 @@ export class BrowserManager {
     console.log(`Storage state saved to ${storagePath}`);
 
     await browser.close();
-    // Wait for Chrome to fully exit so profile data is flushed to disk
-    await this.stopChrome();
+    // Wait for the login Chrome process to fully exit so profile data is flushed to disk.
+    // Use local reference instead of this.chromeProcess to avoid killing the wrong process
+    // if a concurrent launch() overwrites the field.
+    const loginProcess = this.chromeProcess;
+    if (loginProcess && loginProcess.exitCode == null) {
+      loginProcess.kill();
+      await new Promise<void>((r) => loginProcess.once("exit", r));
+    }
+    this.chromeProcess = null;
   }
 
-  /** Reconnect after browser disconnection: restart Chrome and notify all listeners */
-  private async reconnect(): Promise<void> {
+  /** Reconnect after browser disconnection: restart Chrome and notify all listeners.
+   *  Deduplicates concurrent calls — if a reconnect is already in progress, callers share the same promise. */
+  private reconnect(): Promise<void> {
+    if (this.reconnectPromise) return this.reconnectPromise;
+    this.reconnectPromise = this.doReconnect().finally(() => {
+      this.reconnectPromise = null;
+    });
+    return this.reconnectPromise;
+  }
+
+  private async doReconnect(): Promise<void> {
     if (this.browser) {
       await this.browser.close().catch(() => {});
       this.browser = null;
@@ -317,9 +339,10 @@ export class BrowserManager {
     // Match CDP port + profile dir precisely to avoid killing the user's own Chrome
     const profileDir = this.profileDir;
     try {
-      const output = execSync(
-        `pgrep -f "remote-debugging-port=${this.config.cdpPort}" 2>/dev/null || true`,
-        { encoding: "utf-8" }
+      const output = execFileSync(
+        "pgrep",
+        ["-f", `remote-debugging-port=${this.config.cdpPort}`],
+        { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }
       ).trim();
       if (!output) return;
 
@@ -327,9 +350,11 @@ export class BrowserManager {
         const pid = parseInt(pidStr, 10);
         if (isNaN(pid)) continue;
         try {
-          const cmdline = execSync(`ps -p ${pid} -o args= 2>/dev/null`, {
-            encoding: "utf-8",
-          });
+          const cmdline = execFileSync(
+            "ps",
+            ["-p", String(pid), "-o", "args="],
+            { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }
+          );
           if (cmdline.includes(profileDir)) {
             process.kill(pid, "SIGTERM");
           }

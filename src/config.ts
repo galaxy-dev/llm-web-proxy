@@ -97,6 +97,11 @@ function validateConfig(config: Config): void {
   if (enabledCount === 0) {
     throw new Error("config: at least one provider must be enabled");
   }
+  // Guard against path traversal in storageStatePath
+  const resolvedStorage = resolve(config.account.storageStatePath);
+  if (!resolvedStorage.startsWith(resolve("."))) {
+    throw new Error("config: account.storageStatePath must not escape the project directory");
+  }
 }
 
 function assertPort(name: string, value: unknown): void {
