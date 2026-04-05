@@ -15,6 +15,8 @@ export interface ProviderPage {
   /** Convenience: submitMessage + awaitResponse in one call */
   sendMessage(message: string): Promise<string>;
   getPageUrl(): string;
+  /** Release the underlying Page for pool reuse without closing it */
+  releasePage(): Page;
   close(): Promise<void>;
 }
 

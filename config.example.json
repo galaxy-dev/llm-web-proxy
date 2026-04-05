@@ -1,13 +1,18 @@
 {
   "port": 3210,
-  "headless": true,
+  "headless": false,
   "maxSessions": 20,
+  "pagePoolSize": 4,
+  "cdpPort": 9222,
+  "attachmentPrompt": "Please respond to the attached content.",
   "providers": {
     "chatgpt": {
-      "enabled": true
+      "enabled": true,
+      "ephemeral": true
     },
     "claude": {
-      "enabled": false
+      "enabled": false,
+      "ephemeral": true
     }
   },
   "account": {
@@ -16,7 +21,10 @@
   },
   "timeouts": {
     "navigation": 30000,
-    "response": 120000,
+    "responseBase": 30000,
+    "responsePerKB": 2000,
     "stability": 2000
-  }
+  },
+  "sseKeepaliveSec": 30,
+  "orphanGraceSec": 14400
 }

@@ -96,10 +96,11 @@ export abstract class BaseProviderPage implements ProviderPage {
       }, text);
       const modifier = process.platform === "darwin" ? "Meta" : "Control";
       await this.page.keyboard.press(`${modifier}+KeyV`);
+    } finally {
+      // Clear clipboard even on failure to avoid leaking sensitive text
       await this.page
         .evaluate(async () => navigator.clipboard.writeText(""))
         .catch(() => {});
-    } finally {
       releaseClipboard();
     }
   }
@@ -289,6 +290,14 @@ export abstract class BaseProviderPage implements ProviderPage {
 
   getPageUrl(): string {
     return this.page.url();
+  }
+
+  /** Release the underlying Page for pool reuse; clears cached selectors */
+  releasePage(): Page {
+    this.resolved = {};
+    this.beforeCount = 0;
+    this.lastMessageLength = 0;
+    return this.page;
   }
 
   async close(): Promise<void> {

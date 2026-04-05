@@ -27,6 +27,7 @@ const DEFAULTS: Config = {
     claude: { enabled: false, ephemeral: true },
   },
   maxSessions: 20,
+  pagePoolSize: 4,
   cdpPort: 9222,
   attachmentPrompt: "Please respond to the attached content.",
   account: {
@@ -53,6 +54,9 @@ export function loadConfig(configPath?: string): Config {
   }
 
   const raw = JSON.parse(readFileSync(filePath, "utf-8"));
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new Error("config.json must contain a JSON object");
+  }
 
   // Backward compat: migrate old single-provider format to providers map
   if (!raw.providers && raw.provider) {
@@ -89,6 +93,7 @@ function validateConfig(config: Config): void {
   assertPort("port", config.port);
   assertPort("cdpPort", config.cdpPort);
   assertPositiveInt("maxSessions", config.maxSessions);
+  assertPositiveInt("pagePoolSize", config.pagePoolSize);
   for (const [key, value] of Object.entries(config.timeouts)) {
     assertPositiveInt(`timeouts.${key}`, value);
   }

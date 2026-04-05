@@ -7,7 +7,7 @@
 // Reconnects automatically on browser disconnection, notifying upper layers via reconnectListeners
 // (SessionManager uses this to batch-invalidate existing sessions' Page handles).
 
-import { chromium, type Browser, type BrowserContext } from "playwright";
+import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { spawn, execFileSync, type ChildProcess } from "node:child_process";
@@ -34,6 +34,8 @@ export class BrowserManager {
   private reconnectPromise: Promise<void> | null = null;
   /** Serializes browser-interactive operations (page creation, paste, send) to prevent resource contention */
   private browserQueue = new OperationQueue();
+  /** Pre-created blank pages to avoid focus-stealing newPage() during operation */
+  private pagePool: Page[] = [];
   /** Per-provider authentication status */
   private authStatuses = new Map<string, boolean>();
 
@@ -188,6 +190,28 @@ export class BrowserManager {
     return this.browserQueue.enqueue(fn);
   }
 
+  /** Get a page from the pre-created pool, or create a new one as fallback.
+   *  Pool pages are created at startup when Chrome already has focus,
+   *  avoiding focus-stealing newPage() calls during normal operation. */
+  async newPage(): Promise<Page> {
+    const pooled = this.pagePool.pop();
+    if (pooled) return pooled;
+    // Pool exhausted — fall back to direct creation
+    const context = await this.getContext();
+    return context.newPage();
+  }
+
+  /** Return a page to the pool for reuse. Navigates to about:blank to clear state.
+   *  If the page is broken (e.g. after browser reconnect), silently closes it instead. */
+  async recyclePage(page: Page): Promise<void> {
+    try {
+      await page.goto("about:blank", { timeout: 5000 });
+      this.pagePool.push(page);
+    } catch {
+      await page.close().catch(() => {});
+    }
+  }
+
   /** Get the shared browser context (auto-reconnects on disconnect) */
   async getContext(): Promise<BrowserContext> {
     if (this.context) {
@@ -223,7 +247,17 @@ export class BrowserManager {
     }
 
     this.context = context;
-    console.log(`Context initialized for account "${this.config.account.name}"`);
+
+    // Pre-create blank pages so that session creation can use pooled pages
+    // instead of calling context.newPage() which steals focus on macOS.
+    // Created here (during startup) when Chrome already has focus — no user impact.
+    this.pagePool = [];
+    const poolSize = Math.min(this.config.maxSessions, this.config.pagePoolSize);
+    for (let i = 0; i < poolSize; i++) {
+      this.pagePool.push(await context.newPage());
+    }
+
+    console.log(`Context initialized for account "${this.config.account.name}" (${poolSize} pages pooled)`);
   }
 
   /**
@@ -321,6 +355,7 @@ export class BrowserManager {
       });
     }
   }
+
 
   /** Close the browser and Chrome process */
   async close(): Promise<void> {

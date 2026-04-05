@@ -25,6 +25,8 @@ export interface Config {
   /** Per-provider settings keyed by provider name */
   providers: Record<string, ProviderConfig>;
   maxSessions: number;
+  /** Number of blank tabs pre-created at startup to avoid focus stealing on macOS */
+  pagePoolSize: number;
   /** Chrome remote debugging port */
   cdpPort: number;
   account: AccountConfig;

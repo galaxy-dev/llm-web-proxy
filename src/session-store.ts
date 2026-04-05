@@ -60,11 +60,11 @@ export class SessionStore {
         this.scheduleFlush();
       }
     } catch (err: unknown) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code === "EACCES" || code === "EPERM") {
-        throw new Error(`Cannot read session store: ${(err as Error).message}`);
+      if (err instanceof SyntaxError) {
+        console.warn("Session store corrupted, starting fresh");
+        return;
       }
-      console.warn("Failed to load session store, starting fresh");
+      throw err;
     }
   }
 

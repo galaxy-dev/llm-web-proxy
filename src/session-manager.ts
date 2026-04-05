@@ -184,8 +184,7 @@ export class SessionManager {
       let providerPage: ProviderPage | undefined;
       try {
         providerPage = await this.browserManager.withBrowserLock(async () => {
-          const context = await this.browserManager.getContext();
-          const page = await context.newPage();
+          const page = await this.browserManager.newPage();
           return runtime.pageFactory(page, this.config, {
             providerUrl: runtime.providerUrl,
             ephemeral: runtime.ephemeral,
@@ -383,7 +382,9 @@ export class SessionManager {
     await session.lock.drain(new Error(`Session "${sessionId}" closed`));
 
     if (!session.closed) {
-      await session.providerPage.close();
+      // Recycle the page back to the pool instead of destroying it
+      const page = session.providerPage.releasePage();
+      await this.browserManager.recyclePage(page);
       session.closed = true;
       this.sessions.delete(sessionId);
       this.store.remove(sessionId);
