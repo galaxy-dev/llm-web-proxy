@@ -15,10 +15,18 @@
 //   new connections can adopt orphaned sessions by referencing the session ID; unclaimed ones are deleted.
 
 import { createServer } from "node:http";
+import { readFile } from "node:fs/promises";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { z } from "zod";
 import { startProxy } from "./index.js";
+
+/** Resolve message content from either inline text or a file path */
+async function resolveMessage(message?: string, messageFile?: string): Promise<string> {
+  if (messageFile) return readFile(messageFile, "utf-8");
+  if (message) return message;
+  throw new Error("Either message or messageFile is required");
+}
 
 const PROXY_URL = process.env.LLM_WEB_PROXY_URL ?? "http://localhost:3210";
 
@@ -119,7 +127,7 @@ function registerTools(server: McpServer, ownedSessions: Set<string>, clientId: 
   // List available providers
   server.tool(
     "provider_list",
-    "List all available LLM providers.",
+    "List all enabled LLM providers (e.g. chatgpt, claude). Use this to discover valid provider names before calling ask or session_create.",
     {},
     async () => mcpText(JSON.stringify(providers)),
   );
@@ -127,7 +135,7 @@ function registerTools(server: McpServer, ownedSessions: Set<string>, clientId: 
   // Health check: returns per-provider status
   server.tool(
     "health",
-    "Check if the LLM web proxy service is running and get per-provider auth status.",
+    "Check proxy service health and per-provider authentication status. Returns JSON with each provider's authenticated flag. Call this to verify a provider is ready before sending messages.",
     {},
     async () => {
       try {
@@ -143,12 +151,20 @@ function registerTools(server: McpServer, ownedSessions: Set<string>, clientId: 
   // One-shot Q&A: auto create session -> send -> get reply -> close
   server.tool(
     "ask",
-    "Send a message to the LLM and get a response. Auto-manages session lifecycle.",
+    "Stateless one-shot Q&A: creates a temporary session, sends the message, returns the full LLM response, then closes the session. No conversation history is retained. Best for single independent questions. For multi-turn conversations, use session_create + session_send instead. Supports messageFile as an alternative to message — pass a file path to avoid large content in your context window. Note: the response text is returned inline and will consume your context window.",
     {
-      provider: providerEnum.describe("The LLM provider to use"),
-      message: z.string().describe("The message to send to the LLM"),
+      provider: providerEnum.describe("LLM provider name (from provider_list)"),
+      message: z.string().optional().describe("The question or prompt to send (mutually exclusive with messageFile)"),
+      messageFile: z.string().optional().describe("Absolute path to a file whose content will be sent as the message — use this for large inputs to keep your context window small"),
     },
-    async ({ provider, message }) => {
+    async ({ provider, message, messageFile }) => {
+      let content: string;
+      try {
+        content = await resolveMessage(message, messageFile);
+      } catch (err) {
+        return mcpError(err instanceof Error ? err.message : String(err));
+      }
+
       const createResult = await parseOrError<{ sessionId: string }>(
         await api("/sessions", {
           method: "POST",
@@ -159,7 +175,6 @@ function registerTools(server: McpServer, ownedSessions: Set<string>, clientId: 
       );
       if ("error" in createResult) return createResult.error;
       const { sessionId } = createResult.data;
-      // Track for orphan cleanup if SSE disconnects before DELETE completes
       ownedSessions.add(sessionId);
 
       try {
@@ -167,7 +182,7 @@ function registerTools(server: McpServer, ownedSessions: Set<string>, clientId: 
           await api(`/sessions/${sessionId}/chat`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ message }),
+            body: JSON.stringify({ message: content }),
           }),
           "LLM error"
         );
@@ -183,9 +198,9 @@ function registerTools(server: McpServer, ownedSessions: Set<string>, clientId: 
   // Multi-turn conversation: create session
   server.tool(
     "session_create",
-    "Create a new LLM session for multi-turn conversation. Returns a session ID.",
+    "Open a new multi-turn conversation session with an LLM provider. Returns a sessionId to use with session_send. The session retains conversation history across messages. Close with session_close when done.",
     {
-      provider: providerEnum.describe("The LLM provider to use"),
+      provider: providerEnum.describe("LLM provider name (from provider_list)"),
     },
     async ({ provider }) => {
       const result = await parseOrError<{ sessionId: string }>(
@@ -205,12 +220,20 @@ function registerTools(server: McpServer, ownedSessions: Set<string>, clientId: 
   // Multi-turn conversation: send message
   server.tool(
     "session_send",
-    "Send a message to an existing LLM session.",
+    "Send a message in an existing multi-turn session and return the LLM's full response. The session remembers prior messages, so follow-up questions work naturally. Supports messageFile as an alternative to message — pass a file path to avoid large content in your context window. Note: each response is returned inline and accumulates in your context window — prefer ask for independent questions.",
     {
-      sessionId: z.string().describe("The session ID"),
-      message: z.string().describe("The message to send"),
+      sessionId: z.string().describe("Session ID returned by session_create"),
+      message: z.string().optional().describe("The question or prompt to send (mutually exclusive with messageFile)"),
+      messageFile: z.string().optional().describe("Absolute path to a file whose content will be sent as the message — use this for large inputs to keep your context window small"),
     },
-    async ({ sessionId, message }) => {
+    async ({ sessionId, message, messageFile }) => {
+      let content: string;
+      try {
+        content = await resolveMessage(message, messageFile);
+      } catch (err) {
+        return mcpError(err instanceof Error ? err.message : String(err));
+      }
+
       if (!ownedSessions.has(sessionId) && !tryAdoptOrphan(sessionId, ownedSessions, clientId)) {
         return mcpError(`Session ${sessionId} not owned by this connection`);
       }
@@ -218,7 +241,7 @@ function registerTools(server: McpServer, ownedSessions: Set<string>, clientId: 
         await api(`/sessions/${sessionId}/chat`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ message }),
+          body: JSON.stringify({ message: content }),
         }),
         "Error"
       );
@@ -230,7 +253,7 @@ function registerTools(server: McpServer, ownedSessions: Set<string>, clientId: 
   // Multi-turn conversation: list sessions owned by this connection
   server.tool(
     "session_list",
-    "List active LLM sessions owned by this connection (includes provider info).",
+    "List all active sessions owned by the current connection. Returns an array of objects with id and provider fields. Use this to find existing sessions before creating new ones.",
     {},
     async () => {
       const result = await parseOrError<{ id: string; provider: string }[]>(
@@ -246,8 +269,8 @@ function registerTools(server: McpServer, ownedSessions: Set<string>, clientId: 
   // Multi-turn conversation: get session details
   server.tool(
     "session_get",
-    "Get info for a specific LLM session. Returns error if not owned by this connection.",
-    { sessionId: z.string().describe("The session ID") },
+    "Get detailed info for a session (provider, creation time, message count). Only accessible for sessions owned by the current connection.",
+    { sessionId: z.string().describe("Session ID returned by session_create") },
     async ({ sessionId }) => {
       if (!ownedSessions.has(sessionId) && !tryAdoptOrphan(sessionId, ownedSessions, clientId)) {
         return mcpError(`Session ${sessionId} not owned by this connection`);
@@ -264,8 +287,8 @@ function registerTools(server: McpServer, ownedSessions: Set<string>, clientId: 
   // Multi-turn conversation: close session
   server.tool(
     "session_close",
-    "Close an LLM session owned by this connection.",
-    { sessionId: z.string().describe("The session ID to close") },
+    "Close a session and release its resources (browser tab). Always close sessions when the conversation is finished to avoid resource leaks.",
+    { sessionId: z.string().describe("Session ID returned by session_create") },
     async ({ sessionId }) => {
       if (!ownedSessions.has(sessionId) && !tryAdoptOrphan(sessionId, ownedSessions, clientId)) {
         return mcpError(`Session ${sessionId} not owned by this connection`);
