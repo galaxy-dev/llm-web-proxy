@@ -22,7 +22,7 @@
   "timeouts": {
     "navigation": 30000,
     "responseBase": 30000,
-    "responsePerKB": 2000,
+    "responsePerKB": 5000,
     "stability": 2000
   },
   "sseKeepaliveSec": 30,

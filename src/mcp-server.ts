@@ -15,7 +15,8 @@
 //   new connections can adopt orphaned sessions by referencing the session ID; unclaimed ones are deleted.
 
 import { createServer } from "node:http";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { dirname } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { z } from "zod";
@@ -26,6 +27,14 @@ async function resolveMessage(message?: string, messageFile?: string): Promise<s
   if (messageFile) return readFile(messageFile, "utf-8");
   if (message) return message;
   throw new Error("Either message or messageFile is required");
+}
+
+/** Write response content to a file, creating parent directories as needed.
+ *  Returns a confirmation string with path and character count. */
+async function writeResponseFile(filePath: string, content: string): Promise<string> {
+  await mkdir(dirname(filePath), { recursive: true });
+  await writeFile(filePath, content, "utf-8");
+  return `Response written to ${filePath} (${content.length} chars)`;
 }
 
 const PROXY_URL = process.env.LLM_WEB_PROXY_URL ?? "http://localhost:3210";
@@ -151,13 +160,14 @@ function registerTools(server: McpServer, ownedSessions: Set<string>, clientId: 
   // One-shot Q&A: auto create session -> send -> get reply -> close
   server.tool(
     "ask",
-    "Stateless one-shot Q&A: creates a temporary session, sends the message, returns the full LLM response, then closes the session. No conversation history is retained. Best for single independent questions. For multi-turn conversations, use session_create + session_send instead. Supports messageFile as an alternative to message — pass a file path to avoid large content in your context window. Note: the response text is returned inline and will consume your context window.",
+    "Stateless one-shot Q&A: creates a temporary session, sends the message, returns the full LLM response, then closes the session. No conversation history is retained. Best for single independent questions. For multi-turn conversations, use session_create + session_send instead. Supports messageFile as an alternative to message — pass a file path to avoid large content in your context window. Pass responseFile to write the response to a file instead of returning it inline, saving context window space.",
     {
       provider: providerEnum.describe("LLM provider name (from provider_list)"),
       message: z.string().optional().describe("The question or prompt to send (mutually exclusive with messageFile)"),
       messageFile: z.string().optional().describe("Absolute path to a file whose content will be sent as the message — use this for large inputs to keep your context window small"),
+      responseFile: z.string().optional().describe("Absolute path to write the LLM response to instead of returning it inline — use this to avoid consuming context window with large responses"),
     },
-    async ({ provider, message, messageFile }) => {
+    async ({ provider, message, messageFile, responseFile }) => {
       let content: string;
       try {
         content = await resolveMessage(message, messageFile);
@@ -187,7 +197,16 @@ function registerTools(server: McpServer, ownedSessions: Set<string>, clientId: 
           "LLM error"
         );
         if ("error" in chatResult) return chatResult.error;
-        return mcpText(chatResult.data.response);
+        const response = chatResult.data.response;
+
+        if (responseFile) {
+          try {
+            return mcpText(await writeResponseFile(responseFile, response));
+          } catch (err) {
+            return mcpError(`Failed to write response file: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
+        return mcpText(response);
       } finally {
         ownedSessions.delete(sessionId);
         await api(`/sessions/${sessionId}`, { method: "DELETE" }).catch(() => {});
@@ -220,13 +239,14 @@ function registerTools(server: McpServer, ownedSessions: Set<string>, clientId: 
   // Multi-turn conversation: send message
   server.tool(
     "session_send",
-    "Send a message in an existing multi-turn session and return the LLM's full response. The session remembers prior messages, so follow-up questions work naturally. Supports messageFile as an alternative to message — pass a file path to avoid large content in your context window. Note: each response is returned inline and accumulates in your context window — prefer ask for independent questions.",
+    "Send a message in an existing multi-turn session and return the LLM's full response. The session remembers prior messages, so follow-up questions work naturally. Supports messageFile as an alternative to message — pass a file path to avoid large content in your context window. Pass responseFile to write the response to a file instead of returning it inline, saving context window space.",
     {
       sessionId: z.string().describe("Session ID returned by session_create"),
       message: z.string().optional().describe("The question or prompt to send (mutually exclusive with messageFile)"),
       messageFile: z.string().optional().describe("Absolute path to a file whose content will be sent as the message — use this for large inputs to keep your context window small"),
+      responseFile: z.string().optional().describe("Absolute path to write the LLM response to instead of returning it inline — use this to avoid consuming context window with large responses"),
     },
-    async ({ sessionId, message, messageFile }) => {
+    async ({ sessionId, message, messageFile, responseFile }) => {
       let content: string;
       try {
         content = await resolveMessage(message, messageFile);
@@ -246,7 +266,16 @@ function registerTools(server: McpServer, ownedSessions: Set<string>, clientId: 
         "Error"
       );
       if ("error" in result) return result.error;
-      return mcpText(result.data.response);
+      const response = result.data.response;
+
+      if (responseFile) {
+        try {
+          return mcpText(await writeResponseFile(responseFile, response));
+        } catch (err) {
+          return mcpError(`Failed to write response file: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+      return mcpText(response);
     }
   );
 
