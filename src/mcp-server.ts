@@ -279,6 +279,59 @@ function registerTools(server: McpServer, ownedSessions: Set<string>, clientId: 
     }
   );
 
+  // Batch send: fan-out concurrent requests within a single tool call
+  server.tool(
+    "session_send_batch",
+    "Send messages to multiple sessions concurrently and return all responses. This is the recommended way to query multiple sessions in parallel — it bypasses MCP client serialization by fanning out requests server-side. Each item in the requests array has the same fields as session_send.",
+    {
+      requests: z.array(z.object({
+        sessionId: z.string().describe("Session ID returned by session_create"),
+        message: z.string().optional().describe("The question or prompt to send (mutually exclusive with messageFile)"),
+        messageFile: z.string().optional().describe("Absolute path to a file whose content will be sent as the message"),
+        responseFile: z.string().optional().describe("Absolute path to write the response to instead of returning inline"),
+      })).min(1).describe("Array of send requests to execute concurrently"),
+    },
+    async ({ requests }) => {
+      const results = await Promise.allSettled(
+        requests.map(async ({ sessionId, message, messageFile, responseFile }) => {
+          let content: string;
+          content = await resolveMessage(message, messageFile);
+
+          if (!ownedSessions.has(sessionId) && !tryAdoptOrphan(sessionId, ownedSessions, clientId)) {
+            throw new Error(`Session ${sessionId} not owned by this connection`);
+          }
+          const result = await parseOrError<{ response: string }>(
+            await api(`/sessions/${sessionId}/chat`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ message: content }),
+            }),
+            "Error"
+          );
+          if ("error" in result) {
+            throw new Error(result.error.content[0].text);
+          }
+          const response = result.data.response;
+
+          if (responseFile) {
+            return { sessionId, result: await writeResponseFile(responseFile, response) };
+          }
+          return { sessionId, result: response };
+        })
+      );
+
+      const output = results.map((r, i) => {
+        const sid = requests[i].sessionId;
+        if (r.status === "fulfilled") {
+          return r.value;
+        }
+        return { sessionId: sid, error: r.reason instanceof Error ? r.reason.message : String(r.reason) };
+      });
+
+      return mcpText(JSON.stringify(output, null, 2));
+    }
+  );
+
   // Multi-turn conversation: list sessions owned by this connection
   server.tool(
     "session_list",

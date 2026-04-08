@@ -43,6 +43,7 @@ Error shape: `{ error, message }`. 504 may include `partialResponse`.
 | `ask` | `provider`, `message\|messageFile`, `responseFile?` | One-shot Q&A (auto session lifecycle) |
 | `session_create` | `provider` | Create multi-turn session |
 | `session_send` | `sessionId`, `message\|messageFile`, `responseFile?` | Send message to session |
+| `session_send_batch` | `requests[]` | Send to multiple sessions concurrently (fan-out) |
 | `session_list` | — | List sessions (includes provider) |
 | `session_get` | `sessionId` | Get session details |
 | `session_close` | `sessionId` | Close session |
@@ -62,8 +63,8 @@ Copy `config.example.json` to `config.json`. All fields optional, defaults:
 | account.name | "default" |
 | account.storageStatePath | "./.llm-web-proxy/accounts/default.json" |
 | timeouts.navigation | 30000 |
-| timeouts.responseBase | 30000 |
-| timeouts.responsePerKB | 5000 |
+| timeouts.responseBase | 120000 |
+| timeouts.responsePerKB | 30000 |
 | timeouts.stability | 2000 |
 
 `ephemeral` uses temporary/incognito chat mode so conversations are not saved to the account history (ChatGPT: `?temporary-chat=true`, Claude: `?incognito`).
