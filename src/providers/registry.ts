@@ -6,6 +6,8 @@ import type { Config } from "../types.js";
 
 /** Minimal contract for a provider page handler */
 export interface ProviderPage {
+  /** Short identifier for structured logging (set by session-manager after creation) */
+  tag: string;
   navigateToNewChat(): Promise<void>;
   /** Input text, paste, click send — browser-interactive, should run under browser lock */
   submitMessage(message: string): Promise<void>;

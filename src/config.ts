@@ -36,8 +36,8 @@ const DEFAULTS: Config = {
   },
   timeouts: {
     navigation: 30_000,
-    responseBase: 30_000,
-    responsePerKB: 5_000,
+    responseBase: 120_000,
+    responsePerKB: 30_000,
     stability: 2_000,
   },
   sseKeepaliveSec: 30,

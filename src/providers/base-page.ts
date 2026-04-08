@@ -35,10 +35,18 @@ export abstract class BaseProviderPage implements ProviderPage {
     this.ephemeral = options.ephemeral;
   }
 
+  /** Short identifier for structured logging (set by session-manager after creation) */
+  public tag = "";
+
   /** Assistant message count before the current submission, used by awaitResponse */
   protected beforeCount = 0;
   /** Length of the last submitted message, used to calculate response timeout */
   protected lastMessageLength = 0;
+
+  /** Emit a structured log line: timestamp, tag, message */
+  protected log(msg: string): void {
+    console.log(`${new Date().toISOString()} [${this.tag}] ${msg}`);
+  }
 
   /** Input text, paste, click send — browser-interactive phase only */
   abstract submitMessage(text: string): Promise<void>;
@@ -60,6 +68,7 @@ export abstract class BaseProviderPage implements ProviderPage {
    *  @param timeout Response timeout in ms; if omitted, auto-scales based on last submitted message size. */
   async awaitResponse(timeout?: number): Promise<string> {
     const responseTimeout = timeout ?? this.calcResponseTimeout(this.lastMessageLength);
+    this.log(`awaitResponse: timeout=${responseTimeout}ms, beforeCount=${this.beforeCount}`);
     try {
       await this.assistantMessages()
         .nth(this.beforeCount)
@@ -80,6 +89,7 @@ export abstract class BaseProviderPage implements ProviderPage {
       );
     }
 
+    this.log("awaitResponse: new assistant message appeared, waiting for completion");
     await this.waitForResponseComplete(responseTimeout);
     return this.getLastAssistantMessage();
   }
@@ -201,9 +211,12 @@ export abstract class BaseProviderPage implements ProviderPage {
           state: "visible",
           timeout: 3000,
         });
+        this.log("waitForResponse: stop button appeared");
       } catch {
-        // Never appeared — reply may already be complete
+        this.log("waitForResponse: stop button never appeared — reply may already be complete");
       }
+    } else {
+      this.log("waitForResponse: stop button already visible");
     }
 
     let stopButtonCleared = false;
@@ -214,8 +227,9 @@ export abstract class BaseProviderPage implements ProviderPage {
         timeout: remaining,
       });
       stopButtonCleared = true;
+      this.log("waitForResponse: stop button cleared — streaming ended");
     } catch {
-      // Timed out — continue to stability check
+      this.log("waitForResponse: stop button did not clear before deadline");
     }
 
     // Phase 2: text stability check using wall-clock timestamps.
@@ -242,6 +256,7 @@ export abstract class BaseProviderPage implements ProviderPage {
     }
 
     // Use the last polled text instead of an extra DOM read — page may have navigated away
+    this.log(`waitForResponse: timed out — lastText length: ${lastText.length}`);
     throw new ProxyError(
       ErrorCode.RESPONSE_TIMEOUT,
       "Timed out waiting for response",

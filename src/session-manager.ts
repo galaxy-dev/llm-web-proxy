@@ -228,9 +228,10 @@ export class SessionManager {
         invalidated: false,
       };
 
+      session.providerPage.tag = id.slice(0, 8);
       this.sessions.set(id, session);
       this.persistSession(session);
-      console.log(`Session ${id} created (provider: ${providerName}, account: ${accountName})`);
+      console.log(`${new Date().toISOString()} [${id.slice(0, 8)}] session created (provider: ${providerName}, account: ${accountName})`);
 
       return this.toPublicSession(session);
     } finally {
@@ -268,6 +269,7 @@ export class SessionManager {
       );
     }
 
+    const startTime = Date.now();
     try {
       // Re-check after acquiring lock — session may have been closed while queued
       if (session.closing || session.closed) {
@@ -277,17 +279,30 @@ export class SessionManager {
         );
       }
 
+      const tag = sessionId.slice(0, 8);
+      const ts = () => new Date().toISOString();
+      console.log(`${ts()} [${tag}] sendMessage start (${message.length} chars, provider: ${session.provider})`);
+
       // Phase 1: browser interaction (serialized through browser queue)
       await this.browserManager.withBrowserLock(() =>
         session.providerPage.submitMessage(message)
       );
+      const submitMs = Date.now() - startTime;
+      console.log(`${ts()} [${tag}] submitMessage done (${submitMs}ms)`);
+
       // Phase 2: wait for response (runs outside queue — multiple sessions can poll in parallel)
       const response = await session.providerPage.awaitResponse();
+      const totalMs = Date.now() - startTime;
+      console.log(`${ts()} [${tag}] response received (${response.length} chars, ${totalMs}ms)`);
+
       session.lastActivity = new Date();
       session.messageCount++;
       this.persistSession(session);
       return response;
     } catch (err: unknown) {
+      const elapsedMs = Date.now() - startTime;
+      console.error(`${new Date().toISOString()} [${sessionId.slice(0, 8)}] sendMessage failed (${elapsedMs}ms): ${err instanceof Error ? err.message : String(err)}`);
+
       // Session entered closing state during message processing; map to lifecycle error
       if (session.closing || session.closed) {
         if (err instanceof ProxyError) throw err;
@@ -388,7 +403,7 @@ export class SessionManager {
       session.closed = true;
       this.sessions.delete(sessionId);
       this.store.remove(sessionId);
-      console.log(`Session ${sessionId} closed`);
+      console.log(`${new Date().toISOString()} [${sessionId.slice(0, 8)}] session closed`);
     }
   }
 
