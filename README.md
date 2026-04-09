@@ -40,9 +40,9 @@ Error shape: `{ error, message }`. 504 may include `partialResponse`.
 |------|--------|-------------|
 | `provider_list` | — | List available providers |
 | `health` | — | Per-provider auth status |
-| `ask` | `provider`, `message\|messageFile`, `responseFile?` | One-shot Q&A (auto session lifecycle) |
+| `ask` | `provider`, `messageFile`, `responseFile` | One-shot Q&A (auto session lifecycle) |
 | `session_create` | `provider` | Create multi-turn session |
-| `session_send` | `sessionId`, `message\|messageFile`, `responseFile?` | Send message to session |
+| `session_send` | `sessionId`, `messageFile`, `responseFile` | Send message to session |
 | `session_send_batch` | `requests[]` | Send to multiple sessions concurrently (fan-out) |
 | `session_list` | — | List sessions (includes provider) |
 | `session_get` | `sessionId` | Get session details |
