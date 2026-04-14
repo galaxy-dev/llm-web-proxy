@@ -307,6 +307,11 @@ export abstract class BaseProviderPage implements ProviderPage {
     return this.page.url();
   }
 
+  /** Provider-specific cleanup before page release; override in subclass for provider-specific behavior */
+  async cleanup(): Promise<void> {
+    // No-op by default
+  }
+
   /** Release the underlying Page for pool reuse; clears cached selectors */
   releasePage(): Page {
     this.resolved = {};

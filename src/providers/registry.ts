@@ -17,6 +17,8 @@ export interface ProviderPage {
   /** Convenience: submitMessage + awaitResponse in one call */
   sendMessage(message: string): Promise<string>;
   getPageUrl(): string;
+  /** Provider-specific cleanup before page is released (e.g. delete per-conversation cookies) */
+  cleanup(): Promise<void>;
   /** Release the underlying Page for pool reuse without closing it */
   releasePage(): Page;
   close(): Promise<void>;

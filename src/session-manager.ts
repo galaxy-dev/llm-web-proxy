@@ -397,6 +397,8 @@ export class SessionManager {
     await session.lock.drain(new Error(`Session "${sessionId}" closed`));
 
     if (!session.closed) {
+      // Clean up provider-specific resources (e.g. per-conversation cookies)
+      await session.providerPage.cleanup().catch(() => {});
       // Recycle the page back to the pool instead of destroying it
       const page = session.providerPage.releasePage();
       await this.browserManager.recyclePage(page);

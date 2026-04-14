@@ -110,6 +110,13 @@ export class ChatGPTPage extends BaseProviderPage {
     await this.waitUntilSendReadyAndSubmit();
   }
 
+  /** Delete the conv_key cookie for this conversation before page is released */
+  async cleanup(): Promise<void> {
+    const match = this.page.url().match(/\/c\/([0-9a-f-]+)/);
+    if (!match) return;
+    await this.page.context().clearCookies({ name: `conv_key_${match[1]}` });
+  }
+
   /** Wait for attachment element to appear after long text paste; returns whether it succeeded */
   private async waitForAttachment(timeout: number): Promise<boolean> {
     const sel = 'button[aria-label^="Remove file"]';
