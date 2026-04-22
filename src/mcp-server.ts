@@ -14,11 +14,13 @@
 //   On SSE disconnect, sessions are not deleted immediately but placed in an orphan pool;
 //   new connections can adopt orphaned sessions by referencing the session ID; unclaimed ones are deleted.
 
-import { createServer } from "node:http";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { v4 as uuidv4 } from "uuid";
 import { z } from "zod";
 import { startProxy } from "./index.js";
 
@@ -43,8 +45,13 @@ let ORPHAN_GRACE_PERIOD_MS = 14_400_000;
 /** Enabled provider names, set once by main() before any connections are accepted */
 let ENABLED_PROVIDERS: string[] = [];
 
-/** Sessions orphaned by a disconnected SSE connection, awaiting adoption or deletion */
+/** Sessions orphaned by a disconnected MCP connection, awaiting adoption or deletion.
+ *  Shared between SSE and Streamable HTTP transports so a session can be re-adopted
+ *  across transport types (e.g. Claude Code creates, Codex adopts by sessionId). */
 const orphanPool = new Map<string, { timer: NodeJS.Timeout; fromClient: string }>();
+
+/** Active Streamable HTTP transports, keyed by MCP session id (Mcp-Session-Id header) */
+const httpTransports = new Map<string, StreamableHTTPServerTransport>();
 
 /** Move a session to the orphan pool with a timed deletion */
 function orphanSession(sessionId: string, clientId: string): void {
@@ -72,6 +79,33 @@ function tryAdoptOrphan(sessionId: string, ownedSessions: Set<string>, clientId:
   ownedSessions.add(sessionId);
   console.error(`${clientId} adopted session ${sessionId} (from ${from})`);
   return true;
+}
+
+/** Read a JSON request body up to 1MB.
+ *  On overflow writes 413 and returns null; on invalid JSON writes 400 and returns null.
+ *  Caller must return immediately if null is returned. */
+async function readJsonBody(
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<unknown | null> {
+  const MAX_BODY = 1_048_576;
+  let raw = "";
+  for await (const chunk of req) {
+    raw += chunk;
+    if (raw.length > MAX_BODY) {
+      res.writeHead(413, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Request body too large" }));
+      return null;
+    }
+  }
+  if (!raw) return {};
+  try {
+    return JSON.parse(raw);
+  } catch {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Invalid JSON" }));
+    return null;
+  }
 }
 
 /** Send an HTTP request to the proxy service */
@@ -443,28 +477,70 @@ async function main() {
         res.end(JSON.stringify({ error: "Unknown or expired SSE session" }));
         return;
       }
-      // Read request body, limited to 1MB to prevent abuse
-      const MAX_BODY = 1_048_576;
-      let body = "";
-      for await (const chunk of req) {
-        body += chunk;
-        if (body.length > MAX_BODY) {
-          res.writeHead(413, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Request body too large" }));
-          return;
-        }
-      }
+      const parsed = await readJsonBody(req, res);
+      if (parsed === null) return;
+      await transport.handlePostMessage(req, res, parsed);
+      return;
+    }
 
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(body);
-      } catch {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Invalid JSON" }));
+    // Streamable HTTP transport: single endpoint handling POST/GET/DELETE.
+    // Stateful mode — session id is generated on initialize and returned via Mcp-Session-Id header.
+    if (url.pathname === "/stream-http") {
+      const header = req.headers["mcp-session-id"];
+      const mcpSessionId = Array.isArray(header) ? header[0] : header;
+
+      // POST without session id → must be an initialize request; create transport + server.
+      if (req.method === "POST" && !mcpSessionId) {
+        const parsed = await readJsonBody(req, res);
+        if (parsed === null) return;
+
+        const clientId = `[llm-proxy:http-client:${++clientSeq}]`;
+        const { server, ownedSessions } = createMcpServer(clientId);
+
+        const transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => uuidv4(),
+          onsessioninitialized: (sid) => {
+            httpTransports.set(sid, transport);
+            console.error(`${clientId} connected via stream-http, sid=${sid} (total: ${httpTransports.size})`);
+          },
+        });
+
+        // NOTE: transport.onclose fires from inside transport.close() (triggered by DELETE,
+        // cleanup, or end-of-request). Do NOT call server.close() here — it would re-enter
+        // transport.close() via Protocol.close() and recurse until stack overflow.
+        transport.onclose = () => {
+          const sid = transport.sessionId;
+          if (sid) httpTransports.delete(sid);
+          for (const s of ownedSessions) orphanSession(s, clientId);
+          ownedSessions.clear();
+          console.error(`${clientId} disconnected (stream-http, total: ${httpTransports.size})`);
+        };
+
+        await server.connect(transport);
+        await transport.handleRequest(req, res, parsed);
         return;
       }
 
-      await transport.handlePostMessage(req, res, parsed);
+      // GET / POST / DELETE with session id → dispatch to the matching transport.
+      if (mcpSessionId) {
+        const transport = httpTransports.get(mcpSessionId);
+        if (!transport) {
+          res.writeHead(404, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Unknown or expired MCP session" }));
+          return;
+        }
+        let parsed: unknown | undefined;
+        if (req.method === "POST") {
+          const body = await readJsonBody(req, res);
+          if (body === null) return;
+          parsed = body;
+        }
+        await transport.handleRequest(req, res, parsed);
+        return;
+      }
+
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Missing Mcp-Session-Id header" }));
       return;
     }
 
@@ -472,16 +548,21 @@ async function main() {
     res.end();
   });
 
-  // Clean up orphan timers on shutdown to allow clean process exit
-  const cleanupOrphans = () => {
+  // Clean up transports and orphan timers on shutdown to allow clean process exit.
+  // Closing a stream-http transport fires its onclose, which orphans owned sessions.
+  const cleanup = () => {
+    for (const t of httpTransports.values()) t.close().catch(() => {});
+    httpTransports.clear();
     for (const { timer } of orphanPool.values()) clearTimeout(timer);
     orphanPool.clear();
   };
-  process.on("SIGINT", cleanupOrphans);
-  process.on("SIGTERM", cleanupOrphans);
+  process.on("SIGINT", cleanup);
+  process.on("SIGTERM", cleanup);
 
   httpServer.listen(port, "127.0.0.1", () => {
-    console.error(`MCP server (SSE) listening on http://127.0.0.1:${port}/sse`);
+    console.error(`MCP server listening on http://127.0.0.1:${port}`);
+    console.error(`  legacy SSE:      GET /sse  +  POST /message`);
+    console.error(`  Streamable HTTP: /stream-http  (POST/GET/DELETE)`);
   });
 }
 

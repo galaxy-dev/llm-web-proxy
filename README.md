@@ -16,7 +16,10 @@ pnpm exec playwright install chromium
 pnpm run mcp
 ```
 
-Server binds to `127.0.0.1:3210`. MCP SSE endpoint on `0.0.0.0:3211`.
+Server binds to `127.0.0.1:3210`. MCP endpoints on `127.0.0.1:3211`:
+
+- `GET /sse` + `POST /message` — legacy HTTP+SSE transport (Claude Code, older clients)
+- `/stream-http` — Streamable HTTP transport, `POST`/`GET`/`DELETE` (Codex CLI, modern clients)
 
 On startup, all enabled providers are auth-checked automatically.
 Unauthenticated providers open login tabs in parallel for manual login — no separate login step needed.
