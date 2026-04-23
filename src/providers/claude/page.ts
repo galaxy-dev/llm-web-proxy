@@ -54,6 +54,29 @@ export class ClaudePage extends BaseProviderPage {
     });
 
     await this.resolveSelector("messageInput", this.config.timeouts.navigation);
+    await this.dismissConsentBanner();
+  }
+
+  /** Dismiss the GDPR/cookie consent banner if present.
+   *  Claude shows it on first load in a fresh (incognito/ephemeral) context and
+   *  the banner's overlay intercepts pointer events on the send button.
+   *  Best-effort — missing banner is not an error. */
+  private async dismissConsentBanner(): Promise<void> {
+    const candidates = [
+      'button:has-text("Reject All Cookies")',
+      'button:has-text("Reject all")',
+      'button:has-text("Accept All Cookies")',
+      'button:has-text("Accept all")',
+    ];
+    for (const sel of candidates) {
+      const btn = this.page.locator(sel).first();
+      const visible = await btn.isVisible({ timeout: 500 }).catch(() => false);
+      if (visible) {
+        await btn.click().catch(() => {});
+        this.log(`dismissed consent banner via ${sel}`);
+        return;
+      }
+    }
   }
 
   /** Input text, paste, click send — browser-interactive phase only.
