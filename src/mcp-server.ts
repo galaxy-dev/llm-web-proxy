@@ -499,6 +499,9 @@ async function main() {
 
         const transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => uuidv4(),
+          // Return plain JSON responses instead of SSE-wrapped ones for POST.
+          // Rust-based clients (Codex CLI) reject text/event-stream responses on POST.
+          enableJsonResponse: true,
           onsessioninitialized: (sid) => {
             httpTransports.set(sid, transport);
             console.error(`${clientId} connected via stream-http, sid=${sid} (total: ${httpTransports.size})`);
