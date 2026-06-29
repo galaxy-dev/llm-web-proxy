@@ -14,6 +14,15 @@
 // mcp.authToken; every request then requires `Authorization: Bearer <token>`. The HTTP
 // proxy (3210) is never exposed — it stays loopback-only as the internal MCP->HTTP hop.
 //
+// File-based remote chat (B-direct): the MCP file tools take filesystem paths read/written
+// by THIS process, which only works when client and server share a filesystem. For an
+// isolated client (e.g. a Parallels VM with no mount) two raw-HTTP endpoints carry content
+// over the wire instead — request body = prompt, response body = reply:
+//   POST /ask-file?provider=NAME       one-shot (auto session lifecycle)
+//   POST /sessions/:id/chat-file       multi-turn (session from session_create)
+// The agent assembles/consumes the files via shell + curl, so large content never enters
+// its context. Both forward to the loopback proxy's chat endpoint and reuse the auth gate.
+//
 // Session isolation and keepalive:
 //   Each MCP connection maintains its own ownedSessions set, only operating on sessions it created.
 //   SSE connections send :ping heartbeats every 30s to prevent idle timeout disconnects.
@@ -137,6 +146,29 @@ async function readJsonBody(
   }
 }
 
+/** Read a raw (non-JSON) request body up to maxBytes, returned as a UTF-8 string.
+ *  Byte-accurate counting (not string length) so multi-byte content is bounded correctly.
+ *  On overflow writes 413 and returns null; caller must return immediately if null. */
+async function readRawBody(
+  req: IncomingMessage,
+  res: ServerResponse,
+  maxBytes: number,
+): Promise<string | null> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    const buf = chunk as Buffer;
+    size += buf.length;
+    if (size > maxBytes) {
+      res.writeHead(413, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: `Request body too large (max ${maxBytes} bytes)` }));
+      return null;
+    }
+    chunks.push(buf);
+  }
+  return Buffer.concat(chunks).toString("utf-8");
+}
+
 /** Send an HTTP request to the proxy service */
 async function api(path: string, init?: RequestInit): Promise<Response> {
   try {
@@ -187,6 +219,40 @@ async function parseOrError<T>(
     return { error: mcpError(`${prefix}: empty response body`) };
   }
   return { data };
+}
+
+/** Stream a proxy chat response back to a raw-HTTP client as a downloadable text body
+ *  (for the file-based remote chat endpoints). The body is ALWAYS plain text so
+ *  `curl -o reply.txt` captures usable content in every case:
+ *    - full reply        -> 200, body = reply, X-Response-Chars
+ *    - timeout w/ partial -> 504, body = partial text, X-Partial: true (content not lost)
+ *    - other error        -> proxy status, body = error message, X-Error: <code> */
+async function writeChatResult(res: ServerResponse, chatRes: Response): Promise<void> {
+  if (chatRes.ok) {
+    const data = await safeJson<{ response?: string }>(chatRes).catch(() => null);
+    const text = data?.response ?? "";
+    res.writeHead(200, {
+      "Content-Type": "text/plain; charset=utf-8",
+      "X-Response-Chars": String(text.length),
+    });
+    res.end(text);
+    return;
+  }
+  const body = await safeJson<{ error?: string; message?: string; partialResponse?: string }>(chatRes).catch(() => null);
+  if (body?.partialResponse) {
+    res.writeHead(504, {
+      "Content-Type": "text/plain; charset=utf-8",
+      "X-Partial": "true",
+      "X-Response-Chars": String(body.partialResponse.length),
+    });
+    res.end(body.partialResponse);
+    return;
+  }
+  res.writeHead(chatRes.status, {
+    "Content-Type": "text/plain; charset=utf-8",
+    "X-Error": body?.error ?? "ERROR",
+  });
+  res.end(body?.message ?? `HTTP ${chatRes.status}`);
 }
 
 /** Register all MCP tools on the given server instance, scoped to ownedSessions.
@@ -464,6 +530,7 @@ async function main() {
   }
   const host = process.env.MCP_HOST?.trim() || config.mcp.host;
   authToken = process.env.MCP_AUTH_TOKEN?.trim() || config.mcp.authToken.trim();
+  const maxMessageBytes = config.maxMessageBytes;
   const transports = new Map<string, SSEServerTransport>();
   let clientSeq = 0;
 
@@ -594,6 +661,96 @@ async function main() {
       return;
     }
 
+    // File-based chat (B-direct, for isolated clients with no shared filesystem):
+    // request body = the prompt, response body = the reply. Bytes flow disk<->curl<->
+    // network and never enter the agent's context. Auth + (for chat-file) an unguessable
+    // session id are the access boundary. The prompt is forwarded to the loopback HTTP
+    // proxy's chat endpoint; the reply is written back as a plain-text body.
+
+    // One-shot: POST /ask-file?provider=NAME  (auto session create -> chat -> close)
+    if (req.method === "POST" && url.pathname === "/ask-file") {
+      const provider = url.searchParams.get("provider");
+      if (!provider) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Missing ?provider query parameter" }));
+        return;
+      }
+      const message = await readRawBody(req, res, maxMessageBytes);
+      if (message === null) return;
+      if (!message.trim()) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Empty request body (prompt)" }));
+        return;
+      }
+
+      let sessionId: string;
+      try {
+        const createRes = await api("/sessions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ provider }),
+        });
+        const created = await safeJson<{ sessionId?: string; message?: string }>(createRes).catch(() => null);
+        if (!createRes.ok || !created?.sessionId) {
+          res.writeHead(createRes.ok ? 502 : createRes.status, { "Content-Type": "text/plain; charset=utf-8" });
+          res.end(created?.message ?? `Failed to create session (HTTP ${createRes.status})`);
+          return;
+        }
+        sessionId = created.sessionId;
+      } catch (err) {
+        res.writeHead(502, { "Content-Type": "text/plain; charset=utf-8" });
+        res.end(err instanceof Error ? err.message : String(err));
+        return;
+      }
+
+      try {
+        await writeChatResult(res, await api(`/sessions/${sessionId}/chat`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message }),
+        }));
+      } catch (err) {
+        if (!res.headersSent) {
+          res.writeHead(502, { "Content-Type": "text/plain; charset=utf-8" });
+          res.end(err instanceof Error ? err.message : String(err));
+        }
+      } finally {
+        await api(`/sessions/${sessionId}`, { method: "DELETE" }).catch(() => {});
+      }
+      return;
+    }
+
+    // Multi-turn: POST /sessions/:id/chat-file  (session created via MCP session_create)
+    if (req.method === "POST" && url.pathname.startsWith("/sessions/") && url.pathname.endsWith("/chat-file")) {
+      const sessionId = url.pathname.slice("/sessions/".length, -"/chat-file".length);
+      if (!sessionId || sessionId.includes("/")) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Invalid session id" }));
+        return;
+      }
+      const message = await readRawBody(req, res, maxMessageBytes);
+      if (message === null) return;
+      if (!message.trim()) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Empty request body (prompt)" }));
+        return;
+      }
+
+      try {
+        await writeChatResult(res, await api(`/sessions/${sessionId}/chat`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message }),
+        }));
+      } catch (err) {
+        if (!res.headersSent) {
+          res.writeHead(502, { "Content-Type": "text/plain; charset=utf-8" });
+          res.end(err instanceof Error ? err.message : String(err));
+        }
+      }
+      return;
+    }
+
     res.writeHead(404);
     res.end();
   });
@@ -614,6 +771,7 @@ async function main() {
     console.error(`MCP server listening on http://${host}:${port}`);
     console.error(`  legacy SSE:      GET /sse  +  POST /message`);
     console.error(`  Streamable HTTP: /stream-http  (POST/GET/DELETE)`);
+    console.error(`  file chat:       POST /ask-file?provider=NAME  |  POST /sessions/:id/chat-file`);
     console.error(`  auth:            ${authToken ? "Bearer token required" : "disabled (loopback dev)"}`);
     if (!isLoopback && !authToken) {
       console.error(

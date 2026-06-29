@@ -33,6 +33,9 @@ export interface Config {
   account: AccountConfig;
   /** Prompt auto-filled after long text is converted to an attachment */
   attachmentPrompt: string;
+  /** Max chat message size in bytes. Applies to the HTTP chat schema, the file-based
+   *  MCP tools, and the remote chat-file endpoints. Default 1MB. */
+  maxMessageBytes: number;
   timeouts: {
     navigation: number;
     /** Base timeout (ms) for waiting for LLM response, before message-size scaling */

@@ -85,6 +85,47 @@ On the remote client, point Claude Code's `.mcp.json` at the host's IP and pass 
 >   `host.docker.internal` to the host's *loopback*, not to the Parallels interface, so that
 >   consumer would break.
 
+### File-based chat for isolated clients (no shared filesystem)
+
+The MCP file tools (`ask`, `session_send`) take filesystem **paths** that are read/written by
+the proxy process — so they only work when the client and proxy **share a filesystem** (e.g. a
+host-mounted sandbox). A **fully isolated** client (a Parallels VM with no mount, Docker inside
+it) can't use them: its paths don't exist on the proxy host.
+
+For that case the MCP server (3211) exposes two raw-HTTP endpoints where **the request body is
+the prompt and the response body is the reply** — content travels over the wire instead of via
+a shared path. The agent assembles the prompt and consumes the reply with shell + `curl`, so
+large content (diffs, file dumps) **never enters its context window**:
+
+| Method | Path | Body in | Body out |
+|--------|------|---------|----------|
+| POST | `/ask-file?provider=NAME` | prompt | reply (one-shot; auto session lifecycle) |
+| POST | `/sessions/:id/chat-file` | prompt | reply (multi-turn; `:id` from `session_create`) |
+
+```bash
+# build the prompt locally — bytes stay on disk, never in the agent's context
+git diff > /tmp/p.txt && cat src/foo.ts >> /tmp/p.txt
+
+# send it and stream the reply to a file (both directions via curl, not context).
+# NOTE: do NOT use curl -f/--fail here — it discards the body on errors, which would
+# throw away the partial-reply text on a 504. Capture the status code instead.
+code=$(curl -sS -H "Authorization: Bearer $LLM_PROXY_TOKEN" \
+     --data-binary @/tmp/p.txt \
+     "http://<host-ip>:3211/ask-file?provider=chatgpt" \
+     -o /tmp/reply.txt -w '%{http_code}')
+# /tmp/reply.txt now holds: the reply (200), the partial reply (504), or an error message.
+
+# read only what you need from the reply — without cat-ing the whole thing into context
+grep -n "risk\|error" /tmp/reply.txt
+```
+
+- **Auth:** same bearer token as the rest of 3211 (the `Authorization` header is required).
+- **Size:** capped by `maxMessageBytes` (config, default 1MB).
+- **Reply is always text in the body** so `curl -o` captures it in every case: full reply →
+  `200`; **timeout with a partial reply → `504` + header `X-Partial: true`, body = the partial
+  text** (so a slow answer isn't lost); other errors → the proxy's status + an `X-Error` header.
+  Check the HTTP status to distinguish (e.g. `curl -w '%{http_code}'`).
+
 ## API
 
 | Method | Path | Body | Response |

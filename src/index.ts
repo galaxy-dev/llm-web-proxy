@@ -139,7 +139,7 @@ export async function startProxy(): Promise<Config> {
   const sessionManager = new SessionManager(config, browserManager, providerRuntimes);
 
   const enabledNames = [...enabledProviders.keys()];
-  const server = buildServer(sessionManager, browserManager, enabledNames);
+  const server = buildServer(sessionManager, browserManager, enabledNames, config.maxMessageBytes);
 
   // Graceful shutdown: close all sessions -> close browser -> stop HTTP server
   const shutdown = async () => {

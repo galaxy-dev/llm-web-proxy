@@ -18,8 +18,11 @@ export function buildServer(
   sessionManager: SessionManager,
   browserManager: BrowserManager,
   enabledProviders: string[],
+  maxMessageBytes: number,
 ) {
-  const app = Fastify({ logger: true });
+  // bodyLimit must exceed maxMessageBytes: the message arrives JSON-wrapped/escaped,
+  // so the raw body is larger than the message string. 2x + slack covers escaping.
+  const app = Fastify({ logger: true, bodyLimit: maxMessageBytes * 2 + 1024 });
 
   // Unified error handler: ProxyError, validation errors, unknown errors
   app.setErrorHandler<Error>(function (err, _request, reply) {
@@ -109,7 +112,7 @@ export function buildServer(
         type: "object",
         required: ["message"],
         properties: {
-          message: { type: "string", minLength: 1, maxLength: 200_000 },
+          message: { type: "string", minLength: 1, maxLength: maxMessageBytes },
         },
       },
     },

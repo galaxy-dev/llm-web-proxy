@@ -30,6 +30,7 @@ const DEFAULTS: Config = {
   pagePoolSize: 4,
   cdpPort: 9222,
   attachmentPrompt: "Please respond to the attached content.",
+  maxMessageBytes: 1_048_576,
   account: {
     name: "default",
     storageStatePath: "./.llm-web-proxy/accounts/default.json",
@@ -107,6 +108,7 @@ function validateConfig(config: Config): void {
   }
   assertPositiveInt("maxSessions", config.maxSessions);
   assertPositiveInt("pagePoolSize", config.pagePoolSize);
+  assertPositiveInt("maxMessageBytes", config.maxMessageBytes);
   for (const [key, value] of Object.entries(config.timeouts)) {
     assertPositiveInt(`timeouts.${key}`, value);
   }

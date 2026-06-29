@@ -5,6 +5,7 @@
   "pagePoolSize": 4,
   "cdpPort": 9222,
   "attachmentPrompt": "Please respond to the attached content.",
+  "maxMessageBytes": 1048576,
   "providers": {
     "chatgpt": {
       "enabled": true,
