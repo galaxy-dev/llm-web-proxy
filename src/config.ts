@@ -42,6 +42,11 @@ const DEFAULTS: Config = {
   },
   sseKeepaliveSec: 30,
   orphanGraceSec: 14_400,
+  mcp: {
+    host: "127.0.0.1",
+    port: 3211,
+    authToken: "",
+  },
 };
 
 /** Load config file, deep-merge with defaults, and return */
@@ -77,6 +82,7 @@ export function loadConfig(configPath?: string): Config {
     providers: raw.providers ?? { ...DEFAULTS.providers },
     timeouts: { ...DEFAULTS.timeouts, ...(raw.timeouts ?? {}) },
     account: { ...DEFAULTS.account, ...(raw.account ?? {}) },
+    mcp: { ...DEFAULTS.mcp, ...(raw.mcp ?? {}) },
   };
 
   // Ensure each provider entry has defaults applied
@@ -92,6 +98,13 @@ export function loadConfig(configPath?: string): Config {
 function validateConfig(config: Config): void {
   assertPort("port", config.port);
   assertPort("cdpPort", config.cdpPort);
+  assertPort("mcp.port", config.mcp.port);
+  if (typeof config.mcp.host !== "string" || !config.mcp.host.trim()) {
+    throw new Error("config: mcp.host must be a non-empty string");
+  }
+  if (typeof config.mcp.authToken !== "string") {
+    throw new Error("config: mcp.authToken must be a string");
+  }
   assertPositiveInt("maxSessions", config.maxSessions);
   assertPositiveInt("pagePoolSize", config.pagePoolSize);
   for (const [key, value] of Object.entries(config.timeouts)) {

@@ -12,9 +12,12 @@
 //    Listener failures after browser reconnection do not block recovery or trigger rollback.
 //    Rationale: making recovery transactional is too costly; logging is sufficient for debugging.
 //
-// 3. No API access control / token verification
-//    HTTP and MCP servers both bind to 127.0.0.1 with no Authorization header checks.
-//    Rationale: local access only, not exposed to the network.
+// 3. HTTP proxy (3210) has no access control; MCP server (3211) has optional token auth
+//    The Fastify HTTP API binds to 127.0.0.1 only (internal MCP->HTTP hop) with no
+//    Authorization checks — intentionally never network-exposed. The MCP server can be
+//    bound to a non-loopback host to serve a remote/VM client, gated by an optional
+//    bearer token. Configured via config.json's `mcp` section ({ host, port, authToken }),
+//    overridable by env (MCP_HOST / MCP_PORT / MCP_AUTH_TOKEN); see mcp-server.ts.
 //
 // 4. Single-account architecture
 //    Config uses a single account object; no multi-account pooling/scheduling/health tracking.

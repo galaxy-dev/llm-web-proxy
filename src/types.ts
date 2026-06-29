@@ -20,6 +20,7 @@ export interface ProviderConfig {
 }
 
 export interface Config {
+  /** HTTP proxy (REST API) port — loopback only. The MCP server port is mcp.port. */
   port: number;
   headless: boolean;
   /** Per-provider settings keyed by provider name */
@@ -45,6 +46,16 @@ export interface Config {
   sseKeepaliveSec: number;
   /** Grace period in seconds for orphaned sessions after SSE disconnect; deleted if unclaimed */
   orphanGraceSec: number;
+  /** MCP server (3211) network + access control. Env vars override these at startup:
+   *  MCP_HOST > mcp.host, MCP_PORT > mcp.port, MCP_AUTH_TOKEN > mcp.authToken. */
+  mcp: {
+    /** Bind host. Default "127.0.0.1" (loopback). Set "0.0.0.0" to serve a remote/VM client. */
+    host: string;
+    /** MCP server port. */
+    port: number;
+    /** Bearer token required on every MCP request. Empty string disables auth (loopback dev). */
+    authToken: string;
+  };
 }
 
 export type SessionStatus = "active" | "closing" | "stale" | "error";

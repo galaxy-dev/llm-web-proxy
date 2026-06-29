@@ -8,6 +8,12 @@
 // session_send/list/get/close operate by sessionId (provider is implicit).
 // provider_list and health return info about all enabled providers.
 //
+// Access control (3211 only): configured via config.json's `mcp` section
+// ({ host, port, authToken }), with env overrides MCP_HOST / MCP_PORT / MCP_AUTH_TOKEN
+// taking priority. To serve a remote/VM client set mcp.host="0.0.0.0" and a non-empty
+// mcp.authToken; every request then requires `Authorization: Bearer <token>`. The HTTP
+// proxy (3210) is never exposed — it stays loopback-only as the internal MCP->HTTP hop.
+//
 // Session isolation and keepalive:
 //   Each MCP connection maintains its own ownedSessions set, only operating on sessions it created.
 //   SSE connections send :ping heartbeats every 30s to prevent idle timeout disconnects.
@@ -15,6 +21,7 @@
 //   new connections can adopt orphaned sessions by referencing the session ID; unclaimed ones are deleted.
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { timingSafeEqual } from "node:crypto";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -38,6 +45,28 @@ async function writeResponseFile(filePath: string, content: string): Promise<str
 }
 
 const PROXY_URL = process.env.LLM_WEB_PROXY_URL ?? "http://localhost:3210";
+
+/** Bearer token gating inbound MCP connections. Resolved by main() from the
+ *  MCP_AUTH_TOKEN env var (highest priority) or config.mcp.authToken. Empty string =
+ *  auth disabled (the loopback-dev default). When set, every request to the MCP HTTP
+ *  server (3211) must carry `Authorization: Bearer <token>` — this is what makes
+ *  binding to a non-loopback host (mcp.host=0.0.0.0, to serve a Parallels/remote VM)
+ *  safe despite the proxy having no other access control. */
+let authToken = "";
+
+/** Constant-time check of the request's Authorization header against the configured
+ *  token. Returns true when auth is disabled (no token configured). */
+function isAuthorized(req: IncomingMessage): boolean {
+  if (!authToken) return true;
+  const header = req.headers["authorization"];
+  const provided = Array.isArray(header) ? header[0] : header;
+  if (!provided) return false;
+  const expected = `Bearer ${authToken}`;
+  const a = Buffer.from(provided);
+  const b = Buffer.from(expected);
+  // timingSafeEqual throws on length mismatch; length is not secret, so guard first.
+  return a.length === b.length && timingSafeEqual(a, b);
+}
 
 /** Populated by main() after config is loaded */
 let SSE_KEEPALIVE_INTERVAL_MS = 30_000;
@@ -425,16 +454,34 @@ async function main() {
     .filter(([, p]) => p.enabled)
     .map(([name]) => name);
 
-  const rawPort = process.env.MCP_PORT ?? "3211";
+  // MCP server network + auth: config.json's `mcp` section, with env overrides
+  // (MCP_PORT / MCP_HOST / MCP_AUTH_TOKEN) taking priority. The HTTP proxy (3210) is
+  // unaffected — it stays on 127.0.0.1 as the internal-only MCP->HTTP hop.
+  const rawPort = process.env.MCP_PORT ?? String(config.mcp.port);
   const port = parseInt(rawPort, 10);
   if (isNaN(port) || port < 1 || port > 65535) {
     throw new Error(`Invalid MCP_PORT: ${rawPort}`);
   }
+  const host = process.env.MCP_HOST?.trim() || config.mcp.host;
+  authToken = process.env.MCP_AUTH_TOKEN?.trim() || config.mcp.authToken.trim();
   const transports = new Map<string, SSEServerTransport>();
   let clientSeq = 0;
 
   const httpServer = createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
+
+    // Bearer-token gate (no-op when no token is configured). Enforced on every
+    // request — verified that Claude Code forwards the Authorization header on both
+    // the SSE handshake (GET /sse) and follow-up POST /message, as well as on the
+    // Streamable HTTP endpoint, so requiring it everywhere does not lock out clients.
+    if (!isAuthorized(req)) {
+      res.writeHead(401, {
+        "Content-Type": "application/json",
+        "WWW-Authenticate": 'Bearer realm="llm-web-proxy"',
+      });
+      res.end(JSON.stringify({ error: "Unauthorized" }));
+      return;
+    }
 
     if (req.method === "GET" && url.pathname === "/sse") {
       const clientId = `[llm-proxy:sse-client:${++clientSeq}]`;
@@ -562,10 +609,17 @@ async function main() {
   process.on("SIGINT", cleanup);
   process.on("SIGTERM", cleanup);
 
-  httpServer.listen(port, "127.0.0.1", () => {
-    console.error(`MCP server listening on http://127.0.0.1:${port}`);
+  const isLoopback = host === "127.0.0.1" || host === "localhost" || host === "::1";
+  httpServer.listen(port, host, () => {
+    console.error(`MCP server listening on http://${host}:${port}`);
     console.error(`  legacy SSE:      GET /sse  +  POST /message`);
     console.error(`  Streamable HTTP: /stream-http  (POST/GET/DELETE)`);
+    console.error(`  auth:            ${authToken ? "Bearer token required" : "disabled (loopback dev)"}`);
+    if (!isLoopback && !authToken) {
+      console.error(
+        `  WARNING: bound to non-loopback host ${host} with NO auth — set mcp.authToken (or MCP_AUTH_TOKEN) to avoid LAN exposure`,
+      );
+    }
   });
 }
 

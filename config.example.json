@@ -26,5 +26,10 @@
     "stability": 2000
   },
   "sseKeepaliveSec": 30,
-  "orphanGraceSec": 14400
+  "orphanGraceSec": 14400,
+  "mcp": {
+    "host": "127.0.0.1",
+    "port": 3211,
+    "authToken": ""
+  }
 }
